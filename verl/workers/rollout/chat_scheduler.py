@@ -293,6 +293,130 @@ class ChatCompletionScheduler:
             module = importlib.import_module(module_path)
             self.completion_callback = getattr(module, class_name)(config, self)
 
+        # ==== Length Bias Analysis - Cumulative tracking ====
+        self.length_stats_valid_prompts = []  # List of response lengths for valid prompts
+        self.length_stats_invalid_prompts = []  # List of response lengths for invalid prompts
+        self.num_valid_prompts = 0
+        self.num_invalid_prompts = 0
+        self.current_step = None  # Track current training step
+        # ==== END Length Bias Analysis ====
+
+    def reset_length_bias_stats(self):
+        """Reset length bias analysis statistics for a new generation batch."""
+        self.length_stats_valid_prompts = []
+        self.length_stats_invalid_prompts = []
+        self.num_valid_prompts = 0
+        self.num_invalid_prompts = 0
+
+    def _calculate_response_length(self, response_content: str) -> int:
+        """
+        Calculate response length using the same method as response_length/mean.
+        This aligns with the calculation in metric_utils.py where response_length 
+        is computed as response_mask.sum(-1).float().
+        """
+        if not response_content.strip():
+            return 0
+        
+        # Tokenize the response content
+        tokenized = self.completion_callback.tokenizer(
+            response_content, 
+            return_tensors="pt", 
+            padding=False,
+            truncation=False
+        )
+        
+        # Count non-padding tokens (equivalent to attention_mask.sum())
+        # For response content without padding, this is just the length
+        response_length = tokenized["input_ids"].shape[1]
+        
+        return response_length
+
+    def _save_length_bias_data(self, prompt_index: int, n: int, response_lengths: list, scores: list, is_valid: bool):
+        """Save length bias data to file for batch analysis."""
+        import os
+        import json
+        from datetime import datetime
+        
+        # Create filename with timestamp if not exists
+        filename = "length_bias_analysis.jsonl"
+        
+        # Prepare data entry with proper type conversion for JSON serialization
+        data_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "step": int(self.current_step) if self.current_step is not None else None,
+            "prompt_index": int(prompt_index),
+            "n_trajectories": int(n),
+            "response_lengths": [int(x) for x in response_lengths],
+            "scores": [float(x) for x in scores],
+            "is_valid": bool(is_valid),  # Ensure native Python bool type
+            "variance": float(np.var(scores)) if scores else 0.0,
+            "mean_length": float(np.mean(response_lengths)) if response_lengths else 0.0,
+            "std_length": float(np.std(response_lengths)) if len(response_lengths) > 1 else 0.0,
+            "max_length": int(np.max(response_lengths)) if response_lengths else 0,
+            "min_length": int(np.min(response_lengths)) if response_lengths else 0,
+        }
+        
+        # Append to file
+        with open(filename, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(data_entry) + '\n')
+
+    def print_length_bias_summary(self):
+        """Print cumulative length bias analysis summary."""
+        if not self.length_stats_valid_prompts and not self.length_stats_invalid_prompts:
+            return
+        
+        print(f"[DEBUG LENGTH BIAS] ===== GENERATION SUMMARY =====")
+        if self.current_step is not None:
+            print(f"Training Step: {self.current_step}")
+        
+        # Valid prompts statistics
+        if self.length_stats_valid_prompts:
+            import numpy as np
+            valid_mean = np.mean(self.length_stats_valid_prompts)
+            valid_max = np.max(self.length_stats_valid_prompts)
+            valid_min = np.min(self.length_stats_valid_prompts)
+            valid_std = np.std(self.length_stats_valid_prompts) if len(self.length_stats_valid_prompts) > 1 else 0.0
+            print(f"Valid prompts ({self.num_valid_prompts} prompts, {len(self.length_stats_valid_prompts)} trajectories):")
+            print(f"  Response length - Mean: {valid_mean:.2f}, Max: {valid_max:.0f}, Min: {valid_min:.0f}, Std: {valid_std:.2f}")
+        
+        # Invalid prompts statistics
+        if self.length_stats_invalid_prompts:
+            import numpy as np
+            invalid_mean = np.mean(self.length_stats_invalid_prompts)
+            invalid_max = np.max(self.length_stats_invalid_prompts)
+            invalid_min = np.min(self.length_stats_invalid_prompts)
+            invalid_std = np.std(self.length_stats_invalid_prompts) if len(self.length_stats_invalid_prompts) > 1 else 0.0
+            print(f"Invalid prompts ({self.num_invalid_prompts} prompts, {len(self.length_stats_invalid_prompts)} trajectories):")
+            print(f"  Response length - Mean: {invalid_mean:.2f}, Max: {invalid_max:.0f}, Min: {invalid_min:.0f}, Std: {invalid_std:.2f}")
+        
+        # Comparison analysis
+        if self.length_stats_valid_prompts and self.length_stats_invalid_prompts:
+            import numpy as np
+            valid_mean = np.mean(self.length_stats_valid_prompts)
+            invalid_mean = np.mean(self.length_stats_invalid_prompts)
+            length_bias = valid_mean - invalid_mean
+            print(f"Length bias (valid_mean - invalid_mean): {length_bias:.2f}")
+            print(f"Relative length bias: {length_bias / invalid_mean * 100:.2f}%")
+        
+        # Overall statistics
+        all_lengths = self.length_stats_valid_prompts + self.length_stats_invalid_prompts
+        total_prompts = self.num_valid_prompts + self.num_invalid_prompts
+        if all_lengths:
+            import numpy as np
+            overall_mean = np.mean(all_lengths)
+            overall_max = np.max(all_lengths)
+            overall_min = np.min(all_lengths)
+            overall_std = np.std(all_lengths) if len(all_lengths) > 1 else 0.0
+            print(f"Overall ({total_prompts} prompts, {len(all_lengths)} trajectories):")
+            print(f"  Response length - Mean: {overall_mean:.2f}, Max: {overall_max:.0f}, Min: {overall_min:.0f}, Std: {overall_std:.2f}")
+        
+        if total_prompts > 0:
+            filter_ratio = self.num_invalid_prompts / total_prompts * 100
+            print(f"Filter ratio: {filter_ratio:.2f}% prompts filtered")
+        
+        print(f"Detailed data saved to: length_bias_analysis.jsonl")
+        print(f"[DEBUG LENGTH BIAS] ===== END SUMMARY =====")
+
     def submit_chat_completions(self, *, messages: List[Dict[str, str]], request_id: str, info: Dict[str, Any], address: str = None):
         """Submit chat completion request without wait, completion_callback will be called when the request is done.
 
@@ -424,6 +548,13 @@ class ChatCompletionScheduler:
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         t_start = time.time()
+        
+        # Reset length bias statistics at the beginning of each generation
+        self.reset_length_bias_stats()
+        
+        # Get current training step from batch meta_info
+        self.current_step = batch.meta_info.get("global_steps", None)
+        
         kwargs = dict(
             model=self.model_name,
             temperature=self.config.temperature,
@@ -535,6 +666,10 @@ class ChatCompletionScheduler:
         output_batch.meta_info["total_prompts"] = num_prompts
         output_batch.meta_info["original_prompts"] = num_prompts
         output_batch.meta_info["cancelled_request_ids_by_address"] = cancelled_request_ids_by_address
+        
+        # Print length bias analysis summary at the end of generation
+        self.print_length_bias_summary()
+        
         print("[ChatCompletionScheduler] generate_sequences done")
         return output_batch
 
@@ -929,8 +1064,9 @@ class ChatCompletionScheduler:
         """
         try:
             scores = []
+            response_lengths = []  # 用于长度分析
             
-            # 收集该 prompt 对应的 n 个回复的分数
+            # 收集该 prompt 对应的 n 个回复的分数和长度
             for task_offset in range(n):
                 task_index = prompt_index * n + task_offset
                 if task_index < len(batch_conversations) and batch_conversations[task_index] is not None:
@@ -941,6 +1077,12 @@ class ChatCompletionScheduler:
                         for message in reversed(conversation):
                             if message.get("role") == "assistant" and "score" in message:
                                 scores.append(float(message["score"]))
+                                
+                                # 计算response长度，与response_length/mean对齐
+                                assistant_content = message.get("content", "")
+                                response_length = self._calculate_response_length(assistant_content)
+                                response_lengths.append(response_length)
+                                
                                 found_valid_assistant = True
                                 break
                         
@@ -968,6 +1110,24 @@ class ChatCompletionScheduler:
             
             # 检查方差是否不为 0（考虑浮点数精度）
             is_valid = variance > 1e-8
+            
+            # ==== DEBUG: Length Bias Analysis ====
+            # 累积统计信息并保存到文件
+            if response_lengths:
+                # 保存详细数据到文件
+                self._save_length_bias_data(prompt_index, n, response_lengths, scores, is_valid)
+                
+                if is_valid:
+                    self.length_stats_valid_prompts.extend(response_lengths)
+                    self.num_valid_prompts += 1
+                    mean_len = sum(response_lengths) / len(response_lengths) if response_lengths else 0
+                    print(f"[DEBUG LENGTH BIAS] VALID prompt {prompt_index} ({n} trajectories) - mean_len: {mean_len:.1f}")
+                else:
+                    self.length_stats_invalid_prompts.extend(response_lengths)
+                    self.num_invalid_prompts += 1
+                    mean_len = sum(response_lengths) / len(response_lengths) if response_lengths else 0
+                    print(f"[DEBUG LENGTH BIAS] INVALID prompt {prompt_index} ({n} trajectories) - mean_len: {mean_len:.1f}")
+            # ==== END DEBUG ====
             
             if not is_valid:
                 logger.debug(f"Prompt {prompt_index} scores: {scores}, variance: {variance}")

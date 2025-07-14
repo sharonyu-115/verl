@@ -21,6 +21,7 @@ import uuid
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
+import random
 
 import numpy as np
 import torch
@@ -167,6 +168,71 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         return metric_dict
 
+    def _dump_random_trajectories(self, batch, valid_prompt_uids, invalid_prompt_uids, step):
+        """Dump random valid and invalid trajectories with scores."""
+        import json
+        import os
+        import random
+        
+        # Create directory for trajectory dumps
+        dump_dir = "trajectory_dumps"
+        os.makedirs(dump_dir, exist_ok=True)
+        
+        # Helper function to extract trajectory data
+        def extract_trajectory_data(uid):
+            trajectory_data = []
+            uid_indices = [i for i, traj_uid in enumerate(batch.non_tensor_batch["uid"]) if traj_uid == uid]
+            
+            for idx in uid_indices:
+                # Get input text
+                input_ids = batch.batch["input_ids"][idx]
+                input_text = self.tokenizer.decode(input_ids, skip_special_tokens=True)
+                
+                # Get output text
+                response_ids = batch.batch["responses"][idx]
+                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                
+                # Get scores
+                token_scores = batch.batch["token_level_scores"][idx]
+                total_score = token_scores.sum(-1).cpu().item()
+                
+                trajectory_data.append({
+                    "input": input_text,
+                    "output": response_text,
+                #    "token_scores": token_scores.cpu().tolist(),
+                    "total_score": total_score,
+                    "uid": uid,
+                    "step": step,
+                    "trajectory_idx": idx
+                })
+            
+            return trajectory_data
+        
+        # Sample random trajectories
+        sampled_data = []
+        
+        # Sample 1 valid trajectory if available
+        if valid_prompt_uids:
+            valid_uid = random.choice(valid_prompt_uids)
+            valid_trajectories = extract_trajectory_data(valid_uid)
+            sampled_data.extend([{"type": "valid", **traj} for traj in valid_trajectories])
+            print(f"[DEBUG] Sampled valid trajectory with UID: {valid_uid}, total_score: {[t['total_score'] for t in valid_trajectories]}")
+        
+        # Sample 1 invalid trajectory if available
+        if invalid_prompt_uids:
+            invalid_uid = random.choice(invalid_prompt_uids)
+            invalid_trajectories = extract_trajectory_data(invalid_uid)
+            sampled_data.extend([{"type": "invalid", **traj} for traj in invalid_trajectories])
+            print(f"[DEBUG] Sampled invalid trajectory with UID: {invalid_uid}, total_score: {[t['total_score'] for t in invalid_trajectories]}")
+        
+        # Write to file
+        if sampled_data:
+            filename = os.path.join(dump_dir, f"trajectories_step_{step}.jsonl")
+            with open(filename, "w") as f:
+                for entry in sampled_data:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            print(f"[DEBUG] Dumped {len(sampled_data)} trajectories to {filename}")
+
     def fit(self):
         """
         The training loop of PPO.
@@ -211,6 +277,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
+        
         fetch_data_time = time.time()
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -262,6 +329,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             needed_valid_prompt_num -= (len(batch) // self.config.actor_rollout_ref.rollout.n)
                         print(f"[DEBUG] needed_valid_prompt_num: {needed_valid_prompt_num}")
                         gen_batch.meta_info["needed_valid_prompt_num"] = needed_valid_prompt_num
+                        gen_batch.meta_info["global_steps"] = self.global_steps
 
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
@@ -366,6 +434,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                             prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
 
                         kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std > 0 or len(prompt_uid2metric_vals[uid]) == 1]
+                        invalid_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std == 0 and len(prompt_uid2metric_vals[uid]) > 1]
+                        
+                        # Randomly dump 1 valid and 1 invalid prompt trajectory with scores
+                        self._dump_random_trajectories(new_batch, kept_prompt_uids, invalid_prompt_uids, self.global_steps)
+                        
                         num_prompt_in_batch += len(kept_prompt_uids)
 
                         kept_traj_idxs = []
@@ -484,10 +557,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                 timing_raw = defaultdict(float)  # clear timing
 
                 metrics["train/num_gen_batches"] = num_gen_batches
+                
                 batch = None
                 num_prompt_in_batch = 0
                 num_gen_batches = 0
-
+                
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 

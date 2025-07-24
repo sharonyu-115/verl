@@ -249,12 +249,13 @@ class AsyncLLMServerManager:
         
         if abort_futures:
             try:
+                print("Start to abort requests on the vllm server side")
                 # Use return_exceptions=True to prevent one failure from affecting others
                 results = ray.get(abort_futures, timeout=30.0)  # 30 second timeout
                 total_requests = sum(len(ids) for ids in request_ids_by_address.values())
-                logger.info(f"Abort operation completed for {total_requests} requests across {len(request_ids_by_address)} servers")
+                print(f"Abort operation completed for {total_requests} requests across {len(request_ids_by_address)} servers")
             except Exception as e:
-                logger.warning(f"Some abort operations may have failed: {e}")
+                print(f"Some abort operations may have failed: {e}")
                 # Don't re-raise - this is not a critical failure
 
     async def get_num_unfinished_requests(self):

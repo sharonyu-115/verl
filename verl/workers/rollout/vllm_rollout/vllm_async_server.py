@@ -163,6 +163,7 @@ class AsyncvLLMServer(AsyncServerBase):
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         max_num_batched_tokens = config.get("max_num_batched_tokens", 8192)
+        max_num_seqs = config.get("max_num_seqs", 256)
         max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
         max_model_len = int(max_model_len)
 
@@ -195,6 +196,7 @@ class AsyncvLLMServer(AsyncServerBase):
             load_format="auto",
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
@@ -205,6 +207,9 @@ class AsyncvLLMServer(AsyncServerBase):
         vllm_config = engine_args.create_engine_config()
         namespace = ray.get_runtime_context().namespace
         vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
+        from prometheus_client import start_http_server
+        if self.vllm_dp_rank == 1:
+            start_http_server(8111)
         self.engine = AsyncLLM.from_vllm_config(vllm_config)
 
         # build serving chat

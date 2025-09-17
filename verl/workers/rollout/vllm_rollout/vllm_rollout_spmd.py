@@ -645,10 +645,10 @@ class vLLMAsyncRollout(BaseRollout):
 
         # Add the FP8 related logic here as sharding manager has been deprecated.
         # Check if FP8 quantization is enabled and apply appropriate weight loading
-        if fp8_quant.is_fp8_model(model_runner.vllm_config):
+        if is_fp8_model(model_runner.vllm_config):
             logger.info(f"FP8 model detected (async): {model_runner.vllm_config.quant_config}")
             # Convert bf16 weights to fp8 format before loading
-            loaded_params = fp8_quant.load_quanted_weights(weights, model_runner)
+            loaded_params = load_quanted_weights(weights, model_runner)
             logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
         else:
             logger.debug("Loading standard weights (non-FP8, async)")

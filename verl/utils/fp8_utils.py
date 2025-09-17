@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 from unittest.mock import patch
@@ -134,9 +134,8 @@ def scaled_fp8_blockwise(
 
     # Calculate max absolute value per block
     max_abs = torch.amax(torch.abs(data_hp), dim=-1, keepdim=True)
-    # Calculate descale factor
-    descale = max_abs / max_dtype
 
+    # Use FP32 scale
     scale_fp = max_dtype / max_abs
     scale_fp = torch.where(max_abs == 0, 1.0, scale_fp)
     # preserve the behavior for 0 amax case
@@ -162,8 +161,6 @@ def scaled_fp8_blockwise(
 
 def quant_weights(weights, model, quant_config):
     weights_quantized = []
-    qkv_weights = []
-    gate_up_weights = []
     for k, v in weights:
         if not is_fp8_weight(k, model):
             weights_quantized.append((k, v))

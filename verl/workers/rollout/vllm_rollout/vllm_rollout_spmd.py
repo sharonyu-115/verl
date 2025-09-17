@@ -72,7 +72,8 @@ from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import is_npu_available
 from verl.utils.distributed import initialize_global_process_group_ray
-from verl.utils.fp8_utils import apply_vllm_fp8_patches 
+from verl.utils.fp8_utils import apply_vllm_fp8_patches, load_quanted_weights, is_fp8_model 
+
 from verl.utils.model import get_lora_rank_from_adapter
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.ray_utils import ray_noset_visible_devices
@@ -494,11 +495,20 @@ class vLLMRollout(BaseRollout):
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
-
-            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
+            model = model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
 
+            # Add the FP8 related logic here as sharding manager has been deprecated.
+            # Check if FP8 quantization is enabled and apply appropriate weight loading
+            if is_fp8_model(model_runner.vllm_config):
+                logger.info(f"FP8 model detected: {model_runner.vllm_config.quant_config}")
+                # Convert bf16 weights to fp8 format before loading
+                loaded_params = load_quanted_weights(weights, model_runner)
+                logger.info(f"FP8 weights loaded, loaded_params: {len(loaded_params)}")
+            else:
+                logger.debug("Loading standard weights (non-FP8)")
+                model.load_weights(weights)
 
 # https://github.com/vllm-project/vllm/issues/13175
 def _monkey_patch_compute_logits(model, vocab_size: int):
@@ -634,6 +644,7 @@ class vLLMAsyncRollout(BaseRollout):
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+<<<<<<< HEAD
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             # In async mode, make sure the old lora is removed before adding the new one
@@ -652,6 +663,22 @@ class vLLMAsyncRollout(BaseRollout):
 
             model = self.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
+=======
+        from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+        model_runner = self.inference_engine.worker.model_runner
+        model = model_runner.model
+        patch_vllm_moe_model_weight_loader(model)
+
+        # Add the FP8 related logic here as sharding manager has been deprecated.
+        # Check if FP8 quantization is enabled and apply appropriate weight loading
+        if fp8_quant.is_fp8_model(model_runner.vllm_config):
+            logger.info(f"FP8 model detected (async): {model_runner.vllm_config.quant_config}")
+            # Convert bf16 weights to fp8 format before loading
+            loaded_params = fp8_quant.load_quanted_weights(weights, model_runner)
+            logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
+        else:
+            logger.debug("Loading standard weights (non-FP8, async)")
+>>>>>>> 2ef1e2ad (update for latest verl)
             model.load_weights(weights)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:

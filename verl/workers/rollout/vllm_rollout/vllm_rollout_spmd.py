@@ -59,6 +59,7 @@ from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import is_npu_available
 from verl.utils.distributed import initialize_global_process_group_ray
+from verl.utils.fp8_utils import apply_vllm_fp8_patches 
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.ray_utils import ray_noset_visible_devices
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
@@ -173,6 +174,19 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
+        quantization = config.quantization
+        use_block_quant = config.use_block_quant_rollout
+        if quantization:
+            if use_block_quant:
+                FP8_BLOCK_QUANT_KWARGS = {
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                }
+                fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+            apply_vllm_fp8_patches(block_quant=use_block_quant)
+
         compilation_config = {}
 
         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
@@ -204,6 +218,8 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            quantization="fp8" if quantization else None,
+            hf_overrides={"quantization_config": fp8_block_quant_kwargs} if quantization and use_block_quant else None,
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,

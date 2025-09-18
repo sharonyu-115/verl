@@ -63,11 +63,15 @@ from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import is_npu_available
 <<<<<<< HEAD
+<<<<<<< HEAD
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.fp8_utils import apply_vllm_fp8_patches 
 =======
 from verl.utils.fp8_utils import apply_vllm_fp8_patches, load_quanted_weights, is_fp8_model 
 >>>>>>> 2ef1e2ad (update for latest verl)
+=======
+from verl.utils.fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
+>>>>>>> 3ab09973 (update format)
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.ray_utils import ray_noset_visible_devices
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
@@ -471,6 +475,7 @@ class vLLMRollout(BaseRollout):
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
             model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
             model = model_runner.model
             patch_vllm_moe_model_weight_loader(model)
@@ -485,6 +490,7 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.debug("Loading standard weights (non-FP8)")
                 model.load_weights(weights)
+
 
 # https://github.com/vllm-project/vllm/issues/13175
 def _monkey_patch_compute_logits(model, vocab_size: int):
@@ -639,6 +645,7 @@ class vLLMAsyncRollout(BaseRollout):
             patch_vllm_moe_model_weight_loader(model)
 =======
         from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
         model_runner = self.inference_engine.worker.model_runner
         model = model_runner.model
         patch_vllm_moe_model_weight_loader(model)

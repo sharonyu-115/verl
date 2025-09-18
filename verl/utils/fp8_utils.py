@@ -19,11 +19,10 @@ from typing import Optional
 from unittest.mock import patch
 
 import torch
-from transformers import AutoConfig, AutoModel
 
 try:
-    from vllm.model_executor.layers.linear import LinearBase
     from vllm._custom_ops import scaled_fp8_quant
+    from vllm.model_executor.layers.linear import LinearBase
 except ImportError as e:
     raise ImportError("FP8 quantization not available") from e
 
@@ -46,15 +45,14 @@ class FP8State:
     fp8_param_names: set = field(default_factory=lambda: set())
     vllm_patches: list = field(default_factory=lambda: [])
 
+
 fp8_state: FP8State = FP8State()
 
 
 def is_fp8_model(vllm_config):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-    if hasattr(vllm_config, "quant_config") and isinstance(
-        vllm_config.quant_config, Fp8Config
-    ):
+    if hasattr(vllm_config, "quant_config") and isinstance(vllm_config.quant_config, Fp8Config):
         return True
 
     return False
@@ -95,10 +93,7 @@ def is_fp8_weight(name, model):
         if name.endswith("weight"):
             module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
-            if (
-                isinstance(module, LinearBase)
-                and module.weight.dtype == torch.float8_e4m3fn
-            ):
+            if isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn:
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
 
@@ -107,6 +102,7 @@ def scaled_fp8_blockwise(
     data_hp,
     weight_block_size,
 ):
+    # cast tensor from high precision to FP8 with 128*128 blockwise quantization.
     assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
 
     block_size1 = weight_block_size[1]
@@ -149,11 +145,7 @@ def scaled_fp8_blockwise(
     fp_data = data_lp.to(torch.float8_e4m3fn)
 
     # (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N) to (M, N)
-    fp_data = (
-        fp_data.reshape(blk_m, blk_n, block_size0, block_size1)
-        .permute(0, 2, 1, 3)
-        .reshape(original_shape)
-    )
+    fp_data = fp_data.reshape(blk_m, blk_n, block_size0, block_size1).permute(0, 2, 1, 3).reshape(original_shape)
 
     # Convert to target format, but still in original precision container
     return fp_data, descale_fp
@@ -192,7 +184,6 @@ def quant_weights(weights, model, quant_config):
 
 
 def load_quanted_weights(weights, model_runner):
-    #weights_quantized = []
     model = model_runner.model
     quant_config = model_runner.vllm_config.quant_config
 
@@ -215,18 +206,18 @@ def load_quanted_weights(weights, model_runner):
 
 def process_weights_after_loading(self, layer) -> None:
     try:
+        from vllm.model_executor.layers.quantization.utils.w8a8_utils import requantize_with_max_scale
         from vllm.model_executor.parameter import (
             BlockQuantScaleParameter,
             ModelWeightParameter,
-            PerTensorScaleParameter
+            PerTensorScaleParameter,
         )
-        from vllm.model_executor.layers.quantization.utils.w8a8_utils import requantize_with_max_scale
     except Exception:
         try:
             from sglang.srt.layers.parameter import (
                 BlockQuantScaleParameter,
                 ModelWeightParameter,
-                PerTensorScaleParameter
+                PerTensorScaleParameter,
             )
             from sglang.srt.layers.quantization.utils import requantize_with_max_scale
         except Exception:
@@ -239,9 +230,7 @@ def process_weights_after_loading(self, layer) -> None:
         custom_param_dir = dir(custom_param)
         # Find the attributes that are unique to the custom parameter
         custom_attributes = [
-            attr
-            for attr in custom_param_dir
-            if attr not in base_param_dir and not attr.startswith("__")
+            attr for attr in custom_param_dir if attr not in base_param_dir and not attr.startswith("__")
         ]
         # Set the custom attributes into the base parameter object
         for attr in custom_attributes:
@@ -310,11 +299,7 @@ def process_weights_after_loading(self, layer) -> None:
         )
 
 
-def apply(self,
-            layer: torch.nn.Module,
-            x: torch.Tensor,
-            bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-
+def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import apply_fp8_marlin_linear
     from vllm.model_executor.layers.quantization.utils.w8a8_utils import requantize_with_max_scale
 
@@ -326,7 +311,8 @@ def apply(self,
             workspace=layer.workspace,
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
-            bias=bias)
+            bias=bias,
+        )
 
     if self.block_quant:
         assert self.quant_config.weight_block_size is not None
@@ -342,16 +328,19 @@ def apply(self,
         )
 
     weight_scale, weight = requantize_with_max_scale(
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            logical_widths=layer.logical_widths,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        logical_widths=layer.logical_widths,
     )
-    return self.fp8_linear.apply(input=x,
-                                    weight=weight.t(),
-                                    weight_scale=weight_scale,
-                                    out_dtype=self.out_dtype,
-                                    input_scale=layer.input_scale,
-                                    bias=bias)
+    return self.fp8_linear.apply(
+        input=x,
+        weight=weight.t(),
+        weight_scale=weight_scale,
+        out_dtype=self.out_dtype,
+        input_scale=layer.input_scale,
+        bias=bias,
+    )
+
 
 def apply_vllm_fp8_patches(block_quant=True):
     if block_quant:

@@ -10,11 +10,14 @@ We monkey patches several vLLM functions to enable FP8 rollout for reinforcement
 2. **process weights after loading**: Replace `vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading`
 funtion to handle model weights loading after quantization.
 
-**Note**: Currently, we only support VLLM rollout with Megatron training. Sglang rollout with Megatron training is on the roadmap.
+**Notes**: 
+- Currently, we only support VLLM rollout with Megatron training. Sglang rollout with Megatron training is on the roadmap.
+- Only support Batch generate sequences.
+- We also support FP8 per tensor quantization, but after preliminary testing, there were issues with the accuracy and it is not recommended to use it.
 
 ## Usage
 
-It can be enabled in the config file `verl/trainer/config/ppo_megatron_trainer.yaml`:
+FP8 can be enabled in the config file `verl/trainer/config/ppo_megatron_trainer.yaml`:
 
 ```
   rollout:

@@ -492,6 +492,10 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                             "actor/ppo_kl": ppo_kl.detach().item(),
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            "actor/tis_imp_ratio_mean": tis_imp_ratio_mean.detach().item(),
+                            "actor/tis_imp_ratio_max": tis_imp_ratio_max.detach().item(),
+                            "actor/tis_imp_ratio_min": tis_imp_ratio_min.detach().item(),
+                            "actor/tis_clipfrac": tis_clipfrac.detach().item(),
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)

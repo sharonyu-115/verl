@@ -660,8 +660,7 @@ class vLLMAsyncRollout(BaseRollout):
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
-            model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
-            model = model_runner.model
+            model = self.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
 
             # Add the FP8 related logic here as sharding manager has been deprecated.

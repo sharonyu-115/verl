@@ -203,8 +203,6 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
-        seed_value = int(os.getenv("RANK", "0")) // tensor_parallel_size
-        print(f"[DEBUG] Using seed value: {seed_value} (RANK={os.getenv('RANK', '0')}, tensor_parallel_size={tensor_parallel_size})")
 
         self.inference_engine = LLM(
             model=model_path,
@@ -224,8 +222,7 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
-            #seed=config.get("seed", 0),
-            seed=seed_value,
+            seed=config.get("seed", 0),
             quantization="fp8" if quantization else None,
             hf_overrides={"quantization_config": fp8_block_quant_kwargs} if quantization and use_block_quant else None,
             **compilation_config,
@@ -631,7 +628,7 @@ class vLLMAsyncRollout(BaseRollout):
                 peft_config=asdict(peft_config),
                 lora_tensors=dict(weights),
             )
-            self.inference_engine.llm_engine.add_lora(lora_reqest)
+            self.inference_engine.worker.add_lora(lora_reqest)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader

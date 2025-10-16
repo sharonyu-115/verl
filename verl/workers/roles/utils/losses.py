@@ -69,9 +69,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    
-    # Handle different return signatures for different loss modes
-    policy_loss_result = policy_loss_fn(
+    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
@@ -79,17 +77,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
     )
-    
-    # Unpack based on the loss mode (vanilla returns 8 values, others return 4)
-    if loss_mode == "vanilla":
-        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean, tis_imp_ratio_max, tis_imp_ratio_min, tis_clipfrac = policy_loss_result
-    else:
-        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_result
-        # Set default values for TIS metrics for non-vanilla modes
-        tis_imp_ratio_mean = torch.tensor(0.0, device=pg_loss.device)
-        tis_imp_ratio_max = torch.tensor(0.0, device=pg_loss.device)
-        tis_imp_ratio_min = torch.tensor(0.0, device=pg_loss.device)
-        tis_clipfrac = torch.tensor(0.0, device=pg_loss.device)
 
     metrics.update(
         {
@@ -97,10 +84,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
             "pg_clipfrac": pg_clipfrac.detach().item(),
             "ppo_kl": ppo_kl.detach().item(),
             "pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-            "tis_imp_ratio_mean": tis_imp_ratio_mean.detach().item(),
-            "tis_imp_ratio_max": tis_imp_ratio_max.detach().item(),
-            "tis_imp_ratio_min": tis_imp_ratio_min.detach().item(),
-            "tis_clipfrac": tis_clipfrac.detach().item(),
         }
     )
     policy_loss = pg_loss

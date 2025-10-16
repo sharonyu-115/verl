@@ -307,8 +307,41 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    if not self.config.algorithm.use_kl_in_reward:
-                        batch = self.compute_kl_related_metrics(batch, metrics, timing_raw)
+                    # recompute old_log_probs
+                    with marked_timer("old_log_prob", timing_raw, "blue"):
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        entropys = old_log_prob.batch["entropys"]
+                        response_masks = batch.batch["response_mask"]
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                        metrics.update(old_log_prob_metrics)
+                        old_log_prob.batch.pop("entropys")
+                        batch = batch.union(old_log_prob)
+
+                        if "rollout_log_probs" in batch.batch.keys():
+                            # TODO: we may want to add diff of probs too.
+                            from verl.utils.debug.metrics import calculate_debug_metrics
+
+                            # Enable token dumping based on config
+                            dump_high_diff = self.config.trainer.get("dump_high_diff_tokens", False)
+                            dump_threshold = self.config.trainer.get("dump_high_diff_threshold_percentile", 99.0)
+                            dump_dir = self.config.trainer.get("dump_high_diff_dir", "./logprob_diff_dumps")
+                            
+                            metrics.update(calculate_debug_metrics(
+                                batch, 
+                                tokenizer=self.tokenizer,
+                                dump_high_diff=dump_high_diff,
+                                dump_threshold_percentile=dump_threshold,
+                                dump_dir=dump_dir,
+                                step=self.global_steps
+                            ))
+
+                    if self.use_reference_policy:
+                        # compute reference log_prob
+                        with marked_timer("ref", timing_raw, "olive"):
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:

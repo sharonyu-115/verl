@@ -915,17 +915,6 @@ def compute_policy_loss_vanilla(
             config for the actor.
         rollout_log_probs: `(torch.Tensor)`:
             log probabilities of actions under the rollout policy, shape (batch_size, response_length).
-    
-    Returns:
-        tuple containing:
-            - pg_loss: Policy gradient loss
-            - pg_clipfrac: Fraction of clipped policy ratios
-            - ppo_kl: KL divergence between old and new policies
-            - pg_clipfrac_lower: Lower bound clipping fraction
-            - tis_imp_ratio_mean: Mean truncated importance sampling ratio (before clipping)
-            - tis_imp_ratio_max: Maximum truncated importance sampling ratio (before clipping)
-            - tis_imp_ratio_min: Minimum truncated importance sampling ratio (before clipping)
-            - tis_clipfrac: Fraction of TIS ratios that exceeded the cap and were clipped
     """
 
     assert config is not None
@@ -973,19 +962,13 @@ def compute_policy_loss_vanilla(
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
-    # Initialize TIS metrics with default values
-    tis_imp_ratio_mean = torch.tensor(0.0, device=pg_losses.device)
-    tis_imp_ratio_max = torch.tensor(0.0, device=pg_losses.device)
-    tis_imp_ratio_min = torch.tensor(0.0, device=pg_losses.device)
-    tis_clipfrac = torch.tensor(0.0, device=pg_losses.device)
-
     # Apply rollout importance sampling weights if provided
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, tis_imp_ratio_mean, tis_imp_ratio_max, tis_imp_ratio_min, tis_clipfrac
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
 @register_policy_loss("gspo")

@@ -241,7 +241,7 @@ def quant_weights(weights, model, quant_config):
         if quant_config.weight_block_size is not None:
             logger.info("Using blockwise quantization")
             param_lp, param_scale = scaled_fp8_blockwise(
-                v.to(torch.float),
+                v.to(torch.bfloat16),
                 weight_block_size=quant_config.weight_block_size,
             )
             param_scale = param_scale.squeeze(-1)

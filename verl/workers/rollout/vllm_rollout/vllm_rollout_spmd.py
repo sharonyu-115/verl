@@ -189,6 +189,34 @@ class vLLMRollout(BaseRollout):
                     "weight_block_size": [128, 128],
                 }
                 fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+                
+                # Handle num_first_layers_in_bf16 and num_last_layers_in_bf16
+                num_first_layers_in_bf16 = config.get("num_first_layers_in_bf16", 0)
+                num_last_layers_in_bf16 = config.get("num_last_layers_in_bf16", 0)
+                
+                if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
+                    from verl.utils.fp8_utils import get_bf16_layer_names
+                    
+                    # Get BF16 layer names (returns [[first_layers], [last_layers]])
+                    bf16_layer_names = get_bf16_layer_names(
+                        model_hf_config,
+                        num_first_layers=num_first_layers_in_bf16,
+                        num_last_layers=num_last_layers_in_bf16
+                    )
+                    
+                    # Flatten the 2D list to 1D list for vLLM
+                    # vLLM expects a flat list of layer names, not a nested list
+                    bf16_layer_names_flat = []
+                    for layer_group in bf16_layer_names:
+                        bf16_layer_names_flat.extend(layer_group)
+                    
+                    # Add to vLLM's ignored_layers configuration (flattened)
+                    fp8_block_quant_kwargs["ignored_layers"] = bf16_layer_names_flat
+                    
+                    logger.info(f"FP8: Keeping first {num_first_layers_in_bf16} and "
+                               f"last {num_last_layers_in_bf16} layers in BF16")
+                    logger.info(f"FP8: Total {len(bf16_layer_names_flat)} layers will be ignored")
+                    logger.info(f"FP8: Ignored layers: {bf16_layer_names_flat}")
             apply_vllm_fp8_patches(block_quant=use_block_quant)
 
         compilation_config = {}

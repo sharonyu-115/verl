@@ -36,7 +36,6 @@ FP8_BLOCK_QUANT_KWARGS = {
 }
 
 
-# Ref: https://github.com/NVIDIA-NeMo/RL/commit/bc24887c72a6e1b2699a228bc87c588546dfe6b7
 @dataclass()
 class FP8State:
     # A cache of fp8 parameter names, we can check this cache to see if a
@@ -56,6 +55,85 @@ def is_fp8_model(vllm_config):
         return True
 
     return False
+
+
+def _get_params_in_layers(param_names, layers):
+    """Get parameter module names in specified layers.
+    
+    Args:
+        param_names: List of all parameter names in the model
+        layers: List of layer indices to extract parameters from
+        
+    Returns:
+        List of parameter module names (without .weight suffix) in the specified layers
+    """
+    layer_templates = []
+    for i in layers:
+        # Prefixes used by huggingface model transformer layers.
+        # We'll use these to match against the parameter names to determine
+        # which layer the parameter is in.
+        layer_templates.extend(
+            [
+                f"transformer.h.{i}.",
+                f"layers.{i}.",
+                f"layer.{i}.",
+            ]
+        )
+    prefixes = [p for p in layer_templates if any(p in n for n in param_names)]
+    if len(prefixes) == 0:
+        raise ValueError(f"Could not identify layers {layers} for model.")
+
+    params = []
+    for name in param_names:
+        if (
+            any(p in name for p in prefixes)
+            and "bias" not in name
+            and "layernorm" not in name
+            and "norm" not in name
+        ):
+            # Convert the param name into vllm's module name
+            # Vllm wraps the model with an extra 'model'
+            params.append(f"model.{name}".removesuffix(".weight"))
+    return params
+
+
+def get_bf16_layer_names(model_config, num_first_layers=0, num_last_layers=0):
+    """Get parameter module names that should remain in BF16.
+    
+    Args:
+        model_config: HuggingFace model configuration
+        num_first_layers: Number of first layers to keep in BF16
+        num_last_layers: Number of last layers to keep in BF16
+        
+    Returns:
+        List of lists: [[first_layers_params], [last_layers_params]]
+        This matches NeMo-RL's structure for vLLM's ignored_layers parameter
+    """
+    from accelerate import init_empty_weights
+    from transformers import AutoConfig, AutoModel
+    
+    if num_first_layers == 0 and num_last_layers == 0:
+        return []
+    
+    # Create empty model to get parameter names
+    with init_empty_weights():
+        model = AutoModel.from_config(model_config)
+    param_names = [name for name, _ in model.named_parameters()]
+    
+    bf16_params = []  # 二维列表，每个元素是一组层的参数
+    
+    # Get first N layers
+    if num_first_layers > 0:
+        first_layers = list(range(num_first_layers))
+        bf16_params.append(_get_params_in_layers(param_names, first_layers))
+    
+    # Get last M layers
+    if num_last_layers > 0:
+        num_hidden_layers = model_config.num_hidden_layers
+        last_layers = list(range(num_hidden_layers - num_last_layers, num_hidden_layers))
+        bf16_params.append(_get_params_in_layers(param_names, last_layers))
+    
+    return bf16_params
 
 
 def get_module_from_param_name(model, name: str):
@@ -87,15 +165,13 @@ def get_module_from_param_name(model, name: str):
 
 
 def is_fp8_weight(name, model):
-    print(f"[SHARON]Checking if weight is FP8: {name}")
     if name not in fp8_state.seen_params:
         fp8_state.seen_params.add(name)
         # Filter out bias params
         if name.endswith("weight"):
             module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
-            print(f"[SHARON]Module is LinearBase: {isinstance(module, LinearBase)}")
-            print(f"[SHARON]Module is of type: {type(module)}")
+            print(f"[SHARON]Checking if module {module} for name {name} is LinearBase and weight dtype is FP8: {isinstance(module, LinearBase)}, Module type: {type(module)}, Module weight dtype: {module.weight.dtype}")
             if isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn:
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
@@ -165,7 +241,7 @@ def quant_weights(weights, model, quant_config):
         if quant_config.weight_block_size is not None:
             logger.info("Using blockwise quantization")
             param_lp, param_scale = scaled_fp8_blockwise(
-                v.to(torch.float),
+                v.to(torch.bfloat16),
                 weight_block_size=quant_config.weight_block_size,
             )
             param_scale = param_scale.squeeze(-1)

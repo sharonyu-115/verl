@@ -178,7 +178,8 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
     quantization: bool = False
-
+    num_first_layers_in_bf16: int = 0
+    num_last_layers_in_bf16: int = 0
     use_block_quant_rollout: bool = False
     
     def __post_init__(self):

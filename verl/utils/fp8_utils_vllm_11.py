@@ -23,6 +23,7 @@ import torch
 try:
     from vllm._custom_ops import scaled_fp8_quant
     from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 except ImportError as e:
     raise ImportError("FP8 quantization not available") from e
 
@@ -171,8 +172,15 @@ def is_fp8_weight(name, model):
         if name.endswith("weight"):
             module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
-            #print(f"[SHARON]Checking if module {module} for name {name} is LinearBase and weight dtype is FP8: {isinstance(module, LinearBase)}, Module type: {type(module)}, Module weight dtype: {module.weight.dtype}")
-            if isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn:
+            if (
+                isinstance(module, LinearBase) 
+                and module.weight.dtype == torch.float8_e4m3fn
+                or (
+                    isinstance(module, FusedMoE) 
+                    and module.w13_weight.dtype == torch.float8_e4m3fn
+                    and module.w2_weight.dtype == torch.float8_e4m3fn
+                )
+            ):
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
 
@@ -237,7 +245,6 @@ def quant_weights(weights, model, quant_config):
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
-        #print(f"[SHARON]Quantizing weight to FP8: {k}")
         if quant_config.weight_block_size is not None:
             logger.info("Using blockwise quantization")
             param_lp, param_scale = scaled_fp8_blockwise(
@@ -246,8 +253,10 @@ def quant_weights(weights, model, quant_config):
             )
             param_scale = param_scale.squeeze(-1)
             weights_quantized.append([k, param_lp])
-            weights_quantized.append([k + "_scale", param_scale])
-
+            if "expert" in k:
+                weights_quantized.append([k + "_scale_inv", param_scale])
+            else:
+                weights_quantized.append([k + "_scale", param_scale])
         else:
             logger.info("Using Per tensor quantization")
             original_shape = v.shape
@@ -282,7 +291,6 @@ def load_quanted_weights(weights, model_runner):
         if hasattr(param, "subclass_type"):
             param.__class__ = param.orig_type
     # Add a debug print to print the loaded parameters
-    #print(f"[SHARON] loaded_params: {loaded_params}")
     return loaded_params
 
 
@@ -350,6 +358,75 @@ def process_weights_after_loading(self, layer) -> None:
 
     maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)
 
+def process_weights_after_loading_moe(self, layer) -> None:
+    """This function is used to process the weights after loading for a FusedMoE layer.
+    Compared to the original process_weights_after_loading in vllm, we just avoid creation of
+    new torch.nn.Parameter objects, because that removes the weight_loader attribute which we need for refit.
+    """
+    # Lazy import to avoid importing triton too early.
+    from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+        is_rocm_aiter_moe_enabled,
+    )
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        swap_w13_to_w31,
+    )
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        expert_weight_is_col_major,
+        requant_weight_ue8m0_inplace,
+    )
+    from vllm.utils.deep_gemm import (
+        get_col_major_tma_aligned_tensor,
+        is_deep_gemm_e8m0_used,
+    )
+
+    self.rocm_aiter_moe_enabled = is_rocm_aiter_moe_enabled()
+
+    assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
+    assert self.quant_config.activation_scheme == "dynamic"
+
+    if self.flashinfer_moe_backend is not None:
+        layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
+        layer.w13_weight_scale_inv.data = swap_w13_to_w31(
+            layer.w13_weight_scale_inv.data
+        )
+
+    # DeepGemm scales need to be transposed and aligned. We try to do
+    # it ahead of time for performance reasons.
+    if self.allow_deep_gemm and not is_deep_gemm_e8m0_used():
+        if expert_weight_is_col_major(layer.w13_weight_scale_inv):
+            layer.w13_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w13_weight_scale_inv
+            )
+        if expert_weight_is_col_major(layer.w2_weight_scale_inv):
+            layer.w2_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w2_weight_scale_inv
+            )
+
+    if is_deep_gemm_e8m0_used():
+        assert layer.weight_block_size is not None
+        # Re-quantise the expert weights so their scales are UE8M0.
+        block_sz = tuple(layer.weight_block_size)
+        requant_weight_ue8m0_inplace(
+            layer.w13_weight.data,
+            layer.w13_weight_scale_inv.data,
+            block_sz,
+        )
+        requant_weight_ue8m0_inplace(
+            layer.w2_weight.data,
+            layer.w2_weight_scale_inv.data,
+            block_sz,
+        )
+
+        # Ensure column-major TMA alignment expected by DeepGEMM.
+        if expert_weight_is_col_major(layer.w13_weight_scale_inv):
+            layer.w13_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w13_weight_scale_inv
+            )
+        if expert_weight_is_col_major(layer.w2_weight_scale_inv):
+            layer.w2_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w2_weight_scale_inv
+            )
+
 
 def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import apply_fp8_marlin_linear
@@ -396,9 +473,12 @@ def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Te
 
 def apply_vllm_fp8_patches(block_quant=True):
     if block_quant:
-        func_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
-        patcher = patch(func_path, process_weights_after_loading)
-        patcher.start()
+        func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
+        patcher1 = patch(func1_path, process_weights_after_loading)
+        patcher1.start()
+        func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
+        patcher2 = patch(func2_path, process_weights_after_loading_moe)
+        patcher2.start()
     else:
         func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
         patcher1 = patch(func1_path, process_weights_after_loading)

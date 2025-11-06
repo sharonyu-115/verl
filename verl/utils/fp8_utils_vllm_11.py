@@ -171,7 +171,7 @@ def is_fp8_weight(name, model):
         if name.endswith("weight"):
             module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
-            print(f"[SHARON]Checking if module {module} for name {name} is LinearBase and weight dtype is FP8: {isinstance(module, LinearBase)}, Module type: {type(module)}, Module weight dtype: {module.weight.dtype}")
+            #print(f"[SHARON]Checking if module {module} for name {name} is LinearBase and weight dtype is FP8: {isinstance(module, LinearBase)}, Module type: {type(module)}, Module weight dtype: {module.weight.dtype}")
             if isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn:
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
@@ -237,7 +237,7 @@ def quant_weights(weights, model, quant_config):
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
-        print(f"[SHARON]Quantizing weight to FP8: {k}")
+        #print(f"[SHARON]Quantizing weight to FP8: {k}")
         if quant_config.weight_block_size is not None:
             logger.info("Using blockwise quantization")
             param_lp, param_scale = scaled_fp8_blockwise(
@@ -282,7 +282,7 @@ def load_quanted_weights(weights, model_runner):
         if hasattr(param, "subclass_type"):
             param.__class__ = param.orig_type
     # Add a debug print to print the loaded parameters
-    print(f"[SHARON] loaded_params: {loaded_params}")
+    #print(f"[SHARON] loaded_params: {loaded_params}")
     return loaded_params
 
 

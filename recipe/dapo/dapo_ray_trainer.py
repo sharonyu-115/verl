@@ -47,6 +47,110 @@ class RayDAPOTrainer(RayPPOTrainer):
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # KV cache FP8 state
+        self.kv_scales_cache = None
+        self.sync_kv_scales = self._should_sync_kv_scales()
+
+    def _should_sync_kv_scales(self) -> bool:
+        """Check if KV cache FP8 scale synchronization is enabled."""
+        rollout_config = self.config.actor_rollout_ref.rollout
+        
+        # Check if quantization is fp8 and kv_cache_dtype is fp8
+        quantization = rollout_config.get("quantization", None)
+        kv_cache_dtype = rollout_config.get("kv_cache_dtype", "auto")
+        
+        if quantization == "fp8" and kv_cache_dtype in ["fp8", "fp8_e4m3"]:
+            print(f"[KV Cache FP8] Enabled: quantization={quantization}, kv_cache_dtype={kv_cache_dtype}")
+            return True
+        
+        return False
+
+    def _transform_scales_to_vllm_names(self, raw_scales: dict) -> dict:
+        """Transform calibrated scales from actor format to vLLM parameter names.
+        
+        Args:
+            raw_scales: Dictionary from calibrate_qkv_fp8_scales with format:
+                {
+                    "format": "fp8",
+                    "percentile": 99.9,
+                    "margin": 1.05,
+                    "layers": {
+                        "layer_0": {"q_scale": 0.038, "k_scale": 0.041, "v_scale": 0.039},
+                        "layer_1": {...},
+                        ...
+                    }
+                }
+        
+        Returns:
+            Dictionary with vLLM parameter names:
+                {
+                    "model.layers.0.self_attn.q_scale": torch.Tensor([0.038]),
+                    "model.layers.0.self_attn.kv_scale": torch.Tensor([0.041, 0.039]),
+                    "model.layers.1.self_attn.q_scale": torch.Tensor([...]),
+                    ...
+                }
+        """
+        vllm_scales = {}
+        layers = raw_scales.get("layers", {})
+        
+        for layer_name, scales_dict in layers.items():
+            # Extract layer index from "layer_N"
+            layer_idx = int(layer_name.split("_")[1])
+            
+            # vLLM uses different paths for Q vs K/V scales
+            # Q scale: model.layers.{idx}.self_attn.q_scale
+            # KV scale: model.layers.{idx}.self_attn.kv_scale (combined K and V)
+            
+            if "q_scale" in scales_dict:
+                q_param_name = f"model.layers.{layer_idx}.self_attn.q_scale"
+                vllm_scales[q_param_name] = scales_dict["q_scale"]
+            
+            # vLLM expects kv_scale as a combined [k_scale, v_scale] tensor
+            if "k_scale" in scales_dict and "v_scale" in scales_dict:
+                kv_param_name = f"model.layers.{layer_idx}.self_attn.kv_scale"
+                vllm_scales[kv_param_name] = [scales_dict["k_scale"], scales_dict["v_scale"]]
+        
+        print(f"[KV Cache FP8] Transformed scales for {len(vllm_scales)} parameters")
+        return vllm_scales
+
+    def _calibrate_kv_scales(self, calibration_batch: DataProto) -> dict:
+        """Perform KV cache FP8 calibration using the actor model.
+        
+        Args:
+            calibration_batch: DataProto batch for calibration
+        
+        Returns:
+            Dictionary with vLLM-formatted parameter names and scales
+        """
+        rollout_config = self.config.actor_rollout_ref.rollout
+        percentile = rollout_config.get("kv_cache_fp8_percentile", 99.9)
+        margin = rollout_config.get("kv_cache_fp8_margin", 1.05)
+        include_q = rollout_config.get("kv_cache_fp8_include_q", False)
+        
+        print(f"[KV Cache FP8] Starting calibration (percentile={percentile}, margin={margin}, include_q={include_q})")
+        
+        # Call the RPC method on actor workers
+        raw_scales = self.actor_rollout_wg.calibrate_qkv_fp8_scales(
+            calibration_batch,
+            percentile=percentile,
+            margin=margin,
+            include_q=include_q,
+        )
+        
+        # The RPC returns a list of results from each worker, take the first one
+        # (all workers should have identical results after distributed reduction)
+        if isinstance(raw_scales, list):
+            raw_scales = raw_scales[0]
+        
+        print(f"[KV Cache FP8] Calibration complete. Found {len(raw_scales.get('layers', {}))} layers")
+        
+        # Transform to vLLM parameter names
+        vllm_scales = self._transform_scales_to_vllm_names(raw_scales)
+        
+        return vllm_scales
+
     def compute_kl_related_metrics(self, batch: DataProto, metrics: dict, timing_raw: dict):
         batch.batch["response_mask"] = compute_response_mask(batch)
 
@@ -96,6 +200,42 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+
+        # Perform initial KV cache FP8 calibration if enabled
+        if self.sync_kv_scales and self.kv_scales_cache is None:
+            print("\n" + "="*80)
+            print("[KV Cache FP8] Performing initial calibration...")
+            print("="*80)
+            
+            # Get a calibration batch from the training dataloader
+            calibration_batch_dict = next(iter(self.train_dataloader))
+            calibration_batch = DataProto.from_single_dict(calibration_batch_dict)
+            
+            # Prepare the batch for calibration (needs input_ids, attention_mask, position_ids, responses)
+            # We need to generate responses first to get the full sequence for calibration
+            calibration_gen_batch = calibration_batch.pop(
+                batch_keys=["input_ids", "attention_mask", "position_ids"],
+                non_tensor_batch_keys=["raw_prompt_ids"]
+            )
+            
+            # Generate a small batch for calibration
+            print("[KV Cache FP8] Generating calibration sequences...")
+            calibration_gen_output = self.actor_rollout_wg.generate_sequences(calibration_gen_batch)
+            
+            # Merge with original batch to get full data
+            calibration_full_batch = calibration_batch.union(calibration_gen_output)
+            
+            # Perform calibration
+            self.kv_scales_cache = self._calibrate_kv_scales(calibration_full_batch)
+            
+            # Update kv_scales_cache in fsdp_workers via RPC
+            # This will be used in the next rollout_mode() call
+            self.actor_rollout_wg.update_kv_scales_cache(self.kv_scales_cache)
+            
+            print(f"[KV Cache FP8] Initial calibration complete. Cached {len(self.kv_scales_cache)} scale parameters")
+            print("="*80 + "\n")
+            
+            del calibration_batch, calibration_gen_batch, calibration_gen_output, calibration_full_batch
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -394,6 +534,22 @@ class RayDAPOTrainer(RayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        
+                        # Recalibrate KV cache FP8 scales after actor update
+                        if self.sync_kv_scales:
+                            with marked_timer("kv_cache_calibration", timing_raw, "magenta"):
+                                print(f"[KV Cache FP8] Recalibrating scales after actor update (step {self.global_steps})...")
+                                
+                                # Use the current batch for recalibration
+                                self.kv_scales_cache = self._calibrate_kv_scales(batch)
+                                
+                                # Update kv_scales_cache in fsdp_workers via RPC
+                                self.actor_rollout_wg.update_kv_scales_cache(self.kv_scales_cache)
+                                
+                                print(f"[KV Cache FP8] Recalibration complete. Updated {len(self.kv_scales_cache)} scale parameters")
+                                
+                                # Add calibration timing to metrics
+                                metrics["timing/kv_cache_calibration"] = timing_raw.get("kv_cache_calibration", 0.0)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

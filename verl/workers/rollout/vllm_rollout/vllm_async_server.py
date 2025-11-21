@@ -227,7 +227,7 @@ class vLLMHttpServerBase:
                     "weight_block_size": [128, 128],
                 }
                 fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
-            apply_vllm_fp8_patches(block_quant=use_block_quant)
+            apply_vllm_fp8_patches(block_quant=use_block_quant, enable_kv_cache_fp8=False)
 
         args = {
             "dtype": self.config.dtype,

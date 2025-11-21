@@ -44,6 +44,7 @@ class FP8State:
     seen_params: set = field(default_factory=lambda: set())
     fp8_param_names: set = field(default_factory=lambda: set())
     vllm_patches: list = field(default_factory=lambda: [])
+    kv_cache_patches: list = field(default_factory=lambda: [])
 
 
 fp8_state: FP8State = FP8State()
@@ -471,18 +472,131 @@ def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Te
     )
 
 
-def apply_vllm_fp8_patches(block_quant=True):
+def process_weights_after_loading_kv_cache(self, layer) -> None:
+    """Monkey patch for vLLM KV cache FP8 to prevent deletion of scale parameters.
+    
+    This is a patched version of BaseKVCacheMethod.process_weights_after_loading() that
+    keeps k_scale, v_scale, q_scale, and prob_scale parameters instead of deleting them.
+    This allows for dynamic updates of FP8 scales during RL training.
+    
+    Args:
+        self: The BaseKVCacheMethod instance
+        layer: The attention layer containing the scale parameters
+    """
+    from vllm import _custom_ops as ops
+    from vllm.platforms import current_platform
+    
+    # Convert scales from model parameters to internal attributes
+    if layer.kv_cache_dtype == "fp8":
+        k_scale = layer.k_scale
+        v_scale = layer.v_scale
+        # The default k_scale, v_scale is 1, which is invalid for fp8 KV cache
+        # In CUDA, we have to recalculate them if the scale is 1
+        if isinstance(k_scale, float):
+            k_scale_a = torch.full((1,), k_scale, dtype=torch.float32)
+            k_scale_b = k_scale
+        else:
+            k_scale_a = torch.tensor(k_scale.tolist(), dtype=torch.float32)
+            k_scale_b = k_scale.tolist()[0]
+        if isinstance(v_scale, float):
+            v_scale_a = torch.full((1,), v_scale, dtype=torch.float32)
+            v_scale_b = v_scale
+        else:
+            v_scale_a = torch.tensor(v_scale.tolist(), dtype=torch.float32)
+            v_scale_b = v_scale.tolist()[0]
+        layer.calculate_kv_scales = k_scale_b == 1 or v_scale_b == 1
+        layer._k_scale = k_scale_a.to("cuda")
+        layer._v_scale = v_scale_a.to("cuda")
+    else:
+        layer._k_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+        layer._v_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+        layer.calculate_kv_scales = False
+    
+    if layer.calculate_kv_scales and layer.q_scale > 0.0:
+        q_scale = layer.q_scale
+        if current_platform.is_fp8_fnuz():
+            q_scale *= 2
+        layer.calculate_kv_scales = False
+    else:
+        q_scale = 1.0
+    
+    if layer.prob_scale > 0.0:
+        prob_scale = layer.prob_scale
+        if current_platform.is_fp8_fnuz():
+            prob_scale *= 2
+    else:
+        prob_scale = 1.0
+
+    is_singleton_float = lambda x: isinstance(x, float) or (
+        isinstance(x, torch.Tensor) and x.numel() == 1 and x.is_floating_point()
+    )
+    if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
+        raise ValueError("Only support per-tensor scaling factor for fp8-quantized Q/prob")
+
+    # These are used in the final Attention.forward()
+    layer._q_scale.copy_(q_scale)
+    layer._prob_scale.copy_(prob_scale)
+    
+    if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0 or prob_scale == 1.0):
+        logger.warning(
+            f"Using uncalibrated q_scale {q_scale} and/or prob_scale "
+            f"{prob_scale} with fp8 attention. This may cause accuracy "
+            "issues. Please make sure q/prob scaling factors are "
+            "available in the fp8 checkpoint."
+        )
+
+    # CRITICAL CHANGE: We DON'T delete the parameters here to allow for dynamic updates
+    # Original vLLM code deletes: del layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
+    # We keep them so they can be updated via load_weights() during training
+    logger.debug("[KV_SCALES] Patched process_weights_after_loading: kept k_scale/v_scale parameters for dynamic updates")
+
+
+def apply_kv_cache_fp8_patch():
+    """Apply monkey patch to vLLM KV cache to support dynamic scale updates.
+    
+    This patch is required for FP8 KV cache support in RL training, where
+    we need to recalibrate and update Q/K/V scales after each training step.
+    
+    Returns:
+        The patcher object (for tracking and potential cleanup)
+    """
+    func_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+    patcher = patch(func_path, process_weights_after_loading_kv_cache)
+    patcher.start()
+    fp8_state.kv_cache_patches.append(patcher)
+    logger.info("[KV_SCALES] Applied vLLM KV cache FP8 monkey patch for dynamic scale updates")
+    return patcher
+
+
+def apply_vllm_fp8_patches(block_quant=True, enable_kv_cache_fp8=False):
+    """Apply vLLM FP8 patches for weight quantization and optionally KV cache.
+    
+    Args:
+        block_quant: Whether to use block-wise quantization (default: True)
+        enable_kv_cache_fp8: Whether to apply KV cache FP8 patch for dynamic updates (default: False)
+    """
     if block_quant:
         func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
         patcher1 = patch(func1_path, process_weights_after_loading)
         patcher1.start()
+        fp8_state.vllm_patches.append(patcher1)
+        
         func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
         patcher2 = patch(func2_path, process_weights_after_loading_moe)
         patcher2.start()
+        fp8_state.vllm_patches.append(patcher2)
     else:
         func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
         patcher1 = patch(func1_path, process_weights_after_loading)
         patcher1.start()
+        fp8_state.vllm_patches.append(patcher1)
+        
         func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.apply"
         patcher2 = patch(func2_path, apply)
         patcher2.start()
+        fp8_state.vllm_patches.append(patcher2)
+    
+    # Apply KV cache FP8 patch if enabled
+    if enable_kv_cache_fp8:
+        apply_kv_cache_fp8_patch()
+        logger.info("[KV_SCALES] KV cache FP8 support enabled with dynamic scale updates")

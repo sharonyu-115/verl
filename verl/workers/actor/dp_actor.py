@@ -19,6 +19,9 @@ Single Process Actor
 
 import logging
 import os
+import re
+from collections import defaultdict
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -505,3 +508,157 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
+
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: DataProto,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Calibrate FP8 scales for Q/K/V in attention layers.
+        
+        Hooks into attention projection layers (q_proj, k_proj, v_proj) to capture
+        activation magnitudes during a forward pass. Uses compute_log_prob() to trigger
+        the forward pass, then computes percentile-based amax and scales.
+        
+        Args:
+            data: Calibration data batch
+            percentile: Percentile for amax computation (default: 99.9)
+            margin: Safety margin multiplier (default: 1.05)
+            include_q: Whether to include Q scale (default: False)
+        
+        Returns:
+            Dictionary with calibrated scales per layer
+        """
+        import torch.distributed as dist
+        
+        logger = logging.getLogger(__name__)
+        logger.info(f"Starting KV cache FP8 calibration (percentile={percentile}, margin={margin}, include_q={include_q})")
+        
+        # Constants for FP8 E4M3 format
+        FP8_E4M3_MAX = 448.0  # Maximum representable value in FP8 E4M3
+        
+        # Data structures to capture amax values
+        layer_amax = defaultdict(lambda: {"q": [], "k": [], "v": []})
+        hooks = []
+        
+        def create_hook(layer_idx: int, proj_type: str):
+            """Create a forward hook to capture amax for a projection layer."""
+            def hook_fn(module, input, output):
+                # Output shape: [batch, seq_len, hidden_dim] or similar
+                with torch.no_grad():
+                    if isinstance(output, tuple):
+                        output = output[0]
+                    # Compute amax for this activation tensor
+                    amax_val = output.abs().max().item()
+                    layer_amax[layer_idx][proj_type].append(amax_val)
+            return hook_fn
+        
+        # Register hooks on attention projection layers
+        # We need to find q_proj, k_proj, v_proj for each transformer layer
+        module_name_to_layer_idx = {}
+        
+        # Traverse the model to find attention projection layers
+        for name, module in self.actor_module.named_modules():
+            # Match patterns like: model.layers.0.self_attn.q_proj
+            match = re.search(r'layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj)', name)
+            if match:
+                layer_idx = int(match.group(1))
+                proj_type = match.group(2).split('_')[0]  # 'q', 'k', or 'v'
+                
+                # Skip Q if not requested
+                if proj_type == 'q' and not include_q:
+                    continue
+                
+                hook = module.register_forward_hook(create_hook(layer_idx, proj_type))
+                hooks.append(hook)
+                module_name_to_layer_idx[name] = (layer_idx, proj_type)
+                logger.debug(f"Registered hook on {name} -> layer_{layer_idx}.{proj_type}")
+        
+        if not hooks:
+            logger.warning("No attention projection layers found for calibration!")
+            # Remove any registered hooks
+            for hook in hooks:
+                hook.remove()
+            return {
+                "format": "fp8",
+                "percentile": percentile,
+                "margin": margin,
+                "layers": {}
+            }
+        
+        logger.info(f"Registered {len(hooks)} hooks for calibration")
+        
+        # Run forward pass to capture activations
+        # Note: compute_log_prob already handles eval mode and torch.no_grad internally
+        try:
+            _ = self.compute_log_prob(data)
+        finally:
+            # Remove hooks
+            for hook in hooks:
+                hook.remove()
+        
+        # Aggregate amax values and compute percentiles
+        layer_scales = {}
+        
+        for layer_idx in sorted(layer_amax.keys()):
+            layer_data = layer_amax[layer_idx]
+            layer_scales_dict = {}
+            
+            for proj_type in ['q', 'k', 'v']:
+                if proj_type == 'q' and not include_q:
+                    continue
+                    
+                amax_list = layer_data[proj_type]
+                if not amax_list:
+                    logger.warning(f"No amax values captured for layer {layer_idx}, {proj_type}")
+                    continue
+                
+                # Convert to tensor for percentile computation
+                amax_tensor = torch.tensor(amax_list, dtype=torch.float32, device='cuda')
+                
+                # Compute percentile
+                if len(amax_list) > 1:
+                    percentile_val = torch.quantile(amax_tensor, percentile / 100.0).item()
+                else:
+                    percentile_val = amax_tensor.max().item()
+                
+                # Gather percentiles across all ranks for robustness
+                if dist.is_initialized():
+                    # Create tensor for all_gather
+                    local_percentile = torch.tensor([percentile_val], dtype=torch.float32, device='cuda')
+                    world_size = dist.get_world_size()
+                    gathered_percentiles = [torch.zeros_like(local_percentile) for _ in range(world_size)]
+                    dist.all_gather(gathered_percentiles, local_percentile)
+                    
+                    # Take max across all ranks
+                    max_percentile = max(t.item() for t in gathered_percentiles)
+                else:
+                    max_percentile = percentile_val
+                
+                # Apply margin and compute scale
+                amax_with_margin = max_percentile * margin
+                scale = amax_with_margin / FP8_E4M3_MAX
+                
+                layer_scales_dict[f"{proj_type}_scale"] = scale
+                
+                logger.debug(
+                    f"Layer {layer_idx} {proj_type}: "
+                    f"samples={len(amax_list)}, "
+                    f"local_percentile={percentile_val:.6f}, "
+                    f"global_max={max_percentile:.6f}, "
+                    f"scale={scale:.6f}"
+                )
+            
+            if layer_scales_dict:
+                layer_scales[f"layer_{layer_idx}"] = layer_scales_dict
+        
+        logger.info(f"Calibration complete. Computed scales for {len(layer_scales)} layers.")
+        
+        return {
+            "format": "fp8",
+            "percentile": percentile,
+            "margin": margin,
+            "layers": layer_scales
+        }

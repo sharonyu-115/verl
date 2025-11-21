@@ -181,6 +181,11 @@ class RolloutConfig(BaseConfig):
 
     use_block_quant_rollout: bool = False
     
+    # KV cache FP8 quantization configuration
+    kv_cache_dtype: str = "auto"  # Options: "auto", "fp8", "fp8_e5m2"
+    kv_cache_fp8_percentile: float = 99.9  # Percentile for FP8 KV cache scale calibration
+    kv_cache_fp8_margin: float = 1.05  # Safety margin for FP8 KV cache scales
+    
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:

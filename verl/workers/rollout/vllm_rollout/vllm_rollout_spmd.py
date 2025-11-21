@@ -209,6 +209,11 @@ class vLLMRollout(BaseRollout):
 
         quantization = config.quantization
         use_block_quant = config.use_block_quant_rollout
+        kv_cache_dtype = config.kv_cache_dtype
+        
+        # Determine if KV cache FP8 is enabled
+        enable_kv_cache_fp8 = (quantization and kv_cache_dtype == "fp8")
+        
         if quantization:
             if use_block_quant:
                 FP8_BLOCK_QUANT_KWARGS = {
@@ -246,7 +251,12 @@ class vLLMRollout(BaseRollout):
                                f"last {num_last_layers_in_bf16} layers in BF16")
                     logger.info(f"FP8: Total {len(bf16_layer_names_flat)} layers will be ignored")
                     logger.info(f"FP8: Ignored layers: {bf16_layer_names_flat}")
-            apply_vllm_fp8_patches(block_quant=use_block_quant)
+            
+            # Apply FP8 patches including KV cache FP8 if enabled
+            apply_vllm_fp8_patches(block_quant=use_block_quant, enable_kv_cache_fp8=enable_kv_cache_fp8)
+            
+            if enable_kv_cache_fp8:
+                logger.info(f"[KV_SCALES] FP8 KV cache enabled with kv_cache_dtype={kv_cache_dtype}")
 
         compilation_config = {}
 
@@ -264,7 +274,8 @@ class vLLMRollout(BaseRollout):
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
 
-        self.inference_engine = LLM(
+        # Prepare vLLM engine kwargs
+        llm_kwargs = dict(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
             tensor_parallel_size=tensor_parallel_size,
@@ -285,10 +296,19 @@ class vLLMRollout(BaseRollout):
             seed=config.get("seed", 0),
             quantization="fp8" if quantization else None,
             hf_overrides={"quantization_config": fp8_block_quant_kwargs} if quantization and use_block_quant else None,
-            **compilation_config,
-            **self.lora_kwargs,
-            **engine_kwargs,
         )
+        
+        # Add KV cache dtype configuration if FP8 quantization is enabled
+        if quantization and kv_cache_dtype != "auto":
+            llm_kwargs["kv_cache_dtype"] = kv_cache_dtype
+            logger.info(f"[KV_SCALES] Setting kv_cache_dtype={kv_cache_dtype} in vLLM engine")
+        
+        # Merge compilation config, lora kwargs, and engine kwargs
+        llm_kwargs.update(compilation_config)
+        llm_kwargs.update(self.lora_kwargs)
+        llm_kwargs.update(engine_kwargs)
+        
+        self.inference_engine = LLM(**llm_kwargs)
 
         kwargs = dict(
             n=1,
@@ -509,12 +529,18 @@ class vLLMRollout(BaseRollout):
         self.inference_engine.sleep(level=self.sleep_level)
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
-        """Update the weights of the rollout model.
+        """Update the weights of the rollout model, including optional KV cache FP8 scales.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            **kwargs: Additional arguments including:
+                - peft_config: PEFT/LoRA configuration
+                - base_sync_done: Whether base model sync is done
+                - kv_scales: Optional dict mapping parameter names to FP8 scale values for KV cache
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
+        kv_scales = kwargs.get("kv_scales", None)
+        
         if peft_config and base_sync_done:
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
             lora_reqest = TensorLoRARequest(
@@ -533,16 +559,51 @@ class vLLMRollout(BaseRollout):
             model = model_runner.model
             patch_vllm_moe_model_weight_loader(model)
 
+            # Append KV cache FP8 scales to the weights iterator without materializing the entire generator
+            # This is memory-efficient as it keeps the lazy evaluation
+            if kv_scales:
+                logger.info(f"[KV_SCALES] Adding {len(kv_scales)} KV cache FP8 scales to weight update")
+                
+                # Create an iterator for KV scales
+                def kv_scales_iterator():
+                    for param_name, scale_value in kv_scales.items():
+                        # Convert scale to tensor on CUDA device
+                        if isinstance(scale_value, list):
+                            # For kv_scale which combines k_scale and v_scale
+                            scale_tensor = torch.tensor(scale_value, dtype=torch.float32, device="cuda")
+                        else:
+                            # For individual scales
+                            scale_tensor = torch.tensor([scale_value], dtype=torch.float32, device="cuda")
+                        logger.debug(f"[KV_SCALES] {param_name} = {scale_value}")
+                        yield (param_name, scale_tensor)
+                
+                # Chain the weights iterator with KV scales iterator
+                from itertools import chain
+                weights_with_scales = chain(weights, kv_scales_iterator())
+            else:
+                weights_with_scales = weights
+
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
             if is_fp8_model(model_runner.vllm_config):
                 logger.info(f"FP8 model detected: {model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
-                loaded_params = load_quanted_weights(weights, model_runner)
+                loaded_params = load_quanted_weights(weights_with_scales, model_runner)
                 logger.info(f"FP8 weights loaded, loaded_params: {len(loaded_params)}")
+                
+                # Process KV cache scales after loading weights
+                if kv_scales:
+                    logger.info("[KV_SCALES] Processing KV cache scales after weight loading")
+                    try:
+                        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+                        target_device = next(model.parameters()).device
+                        process_weights_after_loading(model, model_runner.model_config, target_device)
+                        logger.info("[KV_SCALES] KV cache scales processing completed successfully")
+                    except Exception as e:
+                        logger.warning(f"[KV_SCALES] Error processing weights after loading: {e}")
             else:
                 logger.debug("Loading standard weights (non-FP8)")
-                model.load_weights(weights)
+                model.load_weights(weights_with_scales)
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -643,7 +704,14 @@ class vLLMAsyncRollout(BaseRollout):
             lora_dtype = getattr(torch, self.config.dtype)
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
         if self.config.quantization:
-            apply_vllm_fp8_patches(block_quant=self.config.use_block_quant_rollout)
+            # Determine if KV cache FP8 is enabled
+            enable_kv_cache_fp8 = (self.config.quantization and self.config.kv_cache_dtype == "fp8")
+            apply_vllm_fp8_patches(
+                block_quant=self.config.use_block_quant_rollout, 
+                enable_kv_cache_fp8=enable_kv_cache_fp8
+            )
+            if enable_kv_cache_fp8:
+                logger.info(f"[KV_SCALES] FP8 KV cache enabled in async mode with kv_cache_dtype={self.config.kv_cache_dtype}")
         self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
         self.inference_engine.init_worker(all_kwargs)
 
@@ -676,12 +744,18 @@ class vLLMAsyncRollout(BaseRollout):
             self.inference_engine.sleep(level=self.sleep_level)
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
-        """Update the weights of the rollout model.
+        """Update the weights of the rollout model, including optional KV cache FP8 scales.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            **kwargs: Additional arguments including:
+                - peft_config: PEFT/LoRA configuration
+                - base_sync_done: Whether base model sync is done
+                - kv_scales: Optional dict mapping parameter names to FP8 scale values for KV cache
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
+        kv_scales = kwargs.get("kv_scales", None)
+        
         if peft_config and base_sync_done:
             # In async mode, make sure the old lora is removed before adding the new one
             self.inference_engine.worker.remove_lora(VLLM_LORA_INT_ID)
@@ -701,16 +775,51 @@ class vLLMAsyncRollout(BaseRollout):
             model = model_runner.model
             patch_vllm_moe_model_weight_loader(model)
 
+            # Append KV cache FP8 scales to the weights iterator without materializing the entire generator
+            # This is memory-efficient as it keeps the lazy evaluation
+            if kv_scales:
+                logger.info(f"[KV_SCALES] Adding {len(kv_scales)} KV cache FP8 scales to weight update (async mode)")
+                
+                # Create an iterator for KV scales
+                def kv_scales_iterator():
+                    for param_name, scale_value in kv_scales.items():
+                        # Convert scale to tensor on CUDA device
+                        if isinstance(scale_value, list):
+                            # For kv_scale which combines k_scale and v_scale
+                            scale_tensor = torch.tensor(scale_value, dtype=torch.float32, device="cuda")
+                        else:
+                            # For individual scales
+                            scale_tensor = torch.tensor([scale_value], dtype=torch.float32, device="cuda")
+                        logger.debug(f"[KV_SCALES] {param_name} = {scale_value}")
+                        yield (param_name, scale_tensor)
+                
+                # Chain the weights iterator with KV scales iterator
+                from itertools import chain
+                weights_with_scales = chain(weights, kv_scales_iterator())
+            else:
+                weights_with_scales = weights
+
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
             if is_fp8_model(model_runner.vllm_config):
                 logger.info(f"FP8 model detected: {model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
-                loaded_params = load_quanted_weights(weights, model_runner)
+                loaded_params = load_quanted_weights(weights_with_scales, model_runner)
                 logger.info(f"FP8 weights loaded, loaded_params: {len(loaded_params)}")
+                
+                # Process KV cache scales after loading weights
+                if kv_scales:
+                    logger.info("[KV_SCALES] Processing KV cache scales after weight loading (async mode)")
+                    try:
+                        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+                        target_device = next(model.parameters()).device
+                        process_weights_after_loading(model, model_runner.model_config, target_device)
+                        logger.info("[KV_SCALES] KV cache scales processing completed successfully")
+                    except Exception as e:
+                        logger.warning(f"[KV_SCALES] Error processing weights after loading: {e}")
             else:
                 logger.debug("Loading standard weights (non-FP8)")
-                model.load_weights(weights)
+                model.load_weights(weights_with_scales)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""

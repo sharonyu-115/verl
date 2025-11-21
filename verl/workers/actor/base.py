@@ -16,6 +16,7 @@ The base class for Actor
 """
 
 from abc import ABC, abstractmethod
+from typing import Any, Optional
 
 import torch
 
@@ -64,3 +65,41 @@ class BasePPOActor(ABC):
 
         """
         pass
+
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: DataProto,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Calibrate FP8 scales for Q/K/V in attention layers.
+        
+        This method hooks into attention projection layers to capture Q, K, V activation
+        magnitudes, computes percentile-based amax values, and calculates FP8 quantization
+        scales. The forward pass is triggered by calling compute_log_prob().
+        
+        Args:
+            data: Calibration data batch (must contain input_ids, attention_mask, position_ids, responses)
+            percentile: Percentile for amax computation (default: 99.9)
+            margin: Safety margin multiplier (default: 1.05)
+            include_q: Whether to include Q scale (default: False, but typically True for KV cache)
+        
+        Returns:
+            Dictionary with format:
+            {
+                "format": "fp8",
+                "percentile": float,
+                "margin": float,
+                "layers": {
+                    "layer_0": {"q_scale": float, "k_scale": float, "v_scale": float},
+                    ...
+                }
+            }
+        """
+        # Default implementation raises NotImplementedError
+        # Subclasses should override this if they support FP8 KV cache calibration
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement calibrate_qkv_fp8_scales(). "
+            "This method is required for FP8 KV cache support."
+        )

@@ -637,6 +637,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # used for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
         self.layered_summon = self.config.rollout.get("layered_summon", False)
+        
+        # used for KV cache FP8
+        self.kv_scales_cache: Optional[dict] = None
 
         # 5. switch to trainer mode
         # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
@@ -713,10 +716,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
                 for name, param in base_model_params.items()
             )
-            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False, kv_scales=self.kv_scales_cache)
             del base_model_params, per_tensor_base_params
 
-        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done, kv_scales=self.kv_scales_cache)
         log_gpu_memory_usage("After update_weights", logger=logger)
         del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
@@ -991,6 +994,62 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: DataProto,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ):
+        """RPC method to calibrate FP8 scales for Q/K/V in attention layers.
+        
+        This method is called from the trainer to perform calibration on the actor model.
+        It delegates to the actor's calibrate_qkv_fp8_scales method and returns the
+        computed scales.
+        
+        Args:
+            data: Calibration data batch
+            percentile: Percentile for amax computation (default: 99.9)
+            margin: Safety margin multiplier (default: 1.05)
+            include_q: Whether to include Q scale (default: False)
+        
+        Returns:
+            Dictionary with calibrated scales per layer
+        """
+        assert self._is_actor, "calibrate_qkv_fp8_scales can only be called on actor ranks"
+        
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        
+        # Call the actor's calibration method
+        with self.ulysses_sharding_manager:
+            scales = self.actor.calibrate_qkv_fp8_scales(
+                data=data,
+                percentile=percentile,
+                margin=margin,
+                include_q=include_q,
+            )
+        
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during calibrate_qkv_fp8_scales", logger=logger)
+        
+        return scales
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_kv_scales_cache(self, kv_scales: dict):
+        """Update the KV cache FP8 scales cache.
+        
+        This method is called from the trainer after calibration to update the
+        kv_scales_cache that will be used in the next rollout_mode() call.
+        
+        Args:
+            kv_scales: Dictionary with vLLM-formatted KV cache scales
+        """
+        self.kv_scales_cache = kv_scales
+        logger.info(f"[KV Cache FP8] Updated kv_scales_cache with {len(kv_scales) if kv_scales else 0} parameters")
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")

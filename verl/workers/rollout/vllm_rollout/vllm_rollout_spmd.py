@@ -253,6 +253,16 @@ class vLLMRollout(BaseRollout):
         if config.enable_rollout_routing_replay:
             router_replay_args = {"enable_return_routed_experts": config.enable_rollout_routing_replay}
 
+        # Prepare KV cache configuration (independent of weight quantization)
+        kv_cache_config = {}
+        if hasattr(config, 'kv_cache_dtype') and config.kv_cache_dtype is not None:
+            kv_cache_config["kv_cache_dtype"] = config.kv_cache_dtype
+            logger.info(f"Setting kv_cache_dtype: {config.kv_cache_dtype}")
+        
+        if hasattr(config, 'calculate_kv_scales') and config.calculate_kv_scales:
+            kv_cache_config["calculate_kv_scales"] = True
+            logger.info("Enabling dynamic KV scale calculation")
+
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -274,6 +284,7 @@ class vLLMRollout(BaseRollout):
             seed=config.get("seed", 0),
             **compilation_config,
             **self.lora_kwargs,
+            **kv_cache_config,
             **engine_kwargs,
             **router_replay_args,
         )
@@ -684,11 +695,18 @@ class vLLMAsyncRollout(BaseRollout):
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
         if self.config.quantization is not None:
             if self.config.quantization == "fp8":
-                # Apply vllm fp8 patches
+                # Apply vllm fp8 patches (pass config for KV cache patch detection)
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
-                apply_vllm_fp8_patches()
+                apply_vllm_fp8_patches(self.config)
             else:
                 raise ValueError(f"Currently only support fp8 quantization, got: {self.config.quantization}")
+        else:
+            # Check if we need KV cache FP8 patches even without weight quantization
+            from verl.utils.vllm.vllm_fp8_utils import is_kv_cache_fp8_enabled, apply_vllm_kv_cache_fp8_wake_up_patch
+            if is_kv_cache_fp8_enabled(self.config):
+                logger.info("[FP8_KV_CACHE] Applying KV cache wake_up patch in worker")
+                apply_vllm_kv_cache_fp8_wake_up_patch()
+        
         self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
         self.inference_engine.init_worker(all_kwargs)
 

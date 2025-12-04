@@ -718,9 +718,9 @@ class vLLMAsyncRollout(BaseRollout):
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
         if self.config.quantization is not None:
             if self.config.quantization == "fp8":
-                # Apply vllm fp8 patches (pass config for KV cache patch detection)
+                # Apply vllm fp8 patches
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
-                apply_vllm_fp8_patches(self.config)
+                apply_vllm_fp8_patches()
             else:
                 raise ValueError(f"Currently only support fp8 quantization, got: {self.config.quantization}")
         

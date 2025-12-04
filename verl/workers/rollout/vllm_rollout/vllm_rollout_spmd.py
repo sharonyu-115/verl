@@ -557,6 +557,14 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.wake_up(tags=tags)
         else:
             self.inference_engine.wake_up()
+        
+        # Initialize KV scale buffers AFTER wake_up restores GPU memory
+        # This prevents inf/nan from uninitialized/garbage GPU memory
+        # Must happen AFTER wake_up (which restores memory) and BEFORE inference
+        if "kv_cache" in tags and self._should_reset_kv_scales():
+            logger.info("[FP8_KV_CACHE] Initializing scale buffers after wake_up (prevents inf/nan)")
+            model_runner = self._get_model_runner()
+            self._reset_kv_scale_flags(model_runner)
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
@@ -566,6 +574,20 @@ class vLLMRollout(BaseRollout):
             return
 
         self.inference_engine.sleep(level=self.sleep_level)
+
+    def _should_reset_kv_scales(self) -> bool:
+        """Check if FP8 KV cache with dynamic scale calculation is enabled."""
+        from verl.utils.vllm.vllm_fp8_utils import is_kv_cache_fp8_enabled
+        return is_kv_cache_fp8_enabled(self.config)
+    
+    def _get_model_runner(self):
+        """Get model_runner reference for sync mode (vLLMRollout)."""
+        return self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
+    
+    def _reset_kv_scale_flags(self, model_runner):
+        """Reset calculate_kv_scales flags after weight update."""
+        from verl.utils.vllm.vllm_fp8_utils import reset_kv_scale_flags_in_model
+        reset_kv_scale_flags_in_model(model_runner)
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update the weights of the rollout model.
@@ -588,7 +610,8 @@ class vLLMRollout(BaseRollout):
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
-            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            model_runner = self._get_model_runner()
+            model = model_runner.model
             patch_vllm_moe_model_weight_loader(model)
             model.load_weights(weights)
             vllm_config = self.inference_engine.llm_engine.vllm_config.model_config
@@ -700,12 +723,6 @@ class vLLMAsyncRollout(BaseRollout):
                 apply_vllm_fp8_patches(self.config)
             else:
                 raise ValueError(f"Currently only support fp8 quantization, got: {self.config.quantization}")
-        else:
-            # Check if we need KV cache FP8 patches even without weight quantization
-            from verl.utils.vllm.vllm_fp8_utils import is_kv_cache_fp8_enabled, apply_vllm_kv_cache_fp8_wake_up_patch
-            if is_kv_cache_fp8_enabled(self.config):
-                logger.info("[FP8_KV_CACHE] Applying KV cache wake_up patch in worker")
-                apply_vllm_kv_cache_fp8_wake_up_patch()
         
         self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
         self.inference_engine.init_worker(all_kwargs)
@@ -730,11 +747,33 @@ class vLLMAsyncRollout(BaseRollout):
         """
         if self.config.free_cache_engine:
             self.inference_engine.wake_up(tags=tags)
+            
+            # Initialize KV scale buffers AFTER wake_up restores GPU memory
+            # This prevents inf/nan from uninitialized/garbage GPU memory
+            # Must happen AFTER wake_up (which restores memory) and BEFORE inference
+            if "kv_cache" in tags and self._should_reset_kv_scales():
+                logger.info("[FP8_KV_CACHE] Initializing scale buffers after wake_up (prevents inf/nan)")
+                model_runner = self._get_model_runner()
+                self._reset_kv_scale_flags(model_runner)
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
         if self.config.free_cache_engine:
             self.inference_engine.sleep(level=self.sleep_level)
+
+    def _should_reset_kv_scales(self) -> bool:
+        """Check if FP8 KV cache with dynamic scale calculation is enabled."""
+        from verl.utils.vllm.vllm_fp8_utils import is_kv_cache_fp8_enabled
+        return is_kv_cache_fp8_enabled(self.config)
+    
+    def _get_model_runner(self):
+        """Get model_runner reference for async mode (vLLMAsyncRollout)."""
+        return self.inference_engine.worker.model_runner
+    
+    def _reset_kv_scale_flags(self, model_runner):
+        """Reset calculate_kv_scales flags after weight update."""
+        from verl.utils.vllm.vllm_fp8_utils import reset_kv_scale_flags_in_model
+        reset_kv_scale_flags_in_model(model_runner)
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update the weights of the rollout model.
@@ -758,7 +797,7 @@ class vLLMAsyncRollout(BaseRollout):
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
-            model_runner = self.inference_engine.worker.model_runner
+            model_runner = self._get_model_runner()
             model = model_runner.model
             patch_vllm_moe_model_weight_loader(model)
 

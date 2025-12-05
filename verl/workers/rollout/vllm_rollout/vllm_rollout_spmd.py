@@ -557,14 +557,6 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.wake_up(tags=tags)
         else:
             self.inference_engine.wake_up()
-        
-        # Initialize KV scale buffers AFTER wake_up restores GPU memory
-        # This prevents inf/nan from uninitialized/garbage GPU memory
-        # Must happen AFTER wake_up (which restores memory) and BEFORE inference
-        if "kv_cache" in tags and self._should_reset_kv_scales():
-            logger.info("[FP8_KV_CACHE] Initializing scale buffers after wake_up (prevents inf/nan)")
-            model_runner = self._get_model_runner()
-            self._reset_kv_scale_flags(model_runner)
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
@@ -617,6 +609,13 @@ class vLLMRollout(BaseRollout):
             vllm_config = self.inference_engine.llm_engine.vllm_config.model_config
             device = next(model.parameters()).device
             process_weights_after_loading(model, vllm_config, device)
+        
+        # Reset KV scale flags after weight update to trigger recalculation on next forward pass
+        # This ensures scales are always computed with the latest weights
+        if self._should_reset_kv_scales():
+            logger.info("Resetting KV scale flags after weight update")
+            model_runner = self._get_model_runner()
+            self._reset_kv_scale_flags(model_runner)
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -747,14 +746,6 @@ class vLLMAsyncRollout(BaseRollout):
         """
         if self.config.free_cache_engine:
             self.inference_engine.wake_up(tags=tags)
-            
-            # Initialize KV scale buffers AFTER wake_up restores GPU memory
-            # This prevents inf/nan from uninitialized/garbage GPU memory
-            # Must happen AFTER wake_up (which restores memory) and BEFORE inference
-            if "kv_cache" in tags and self._should_reset_kv_scales():
-                logger.info("[FP8_KV_CACHE] Initializing scale buffers after wake_up (prevents inf/nan)")
-                model_runner = self._get_model_runner()
-                self._reset_kv_scale_flags(model_runner)
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
@@ -811,6 +802,13 @@ class vLLMAsyncRollout(BaseRollout):
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
                 model.load_weights(weights)
+        
+        # Reset KV scale flags after weight update to trigger recalculation on next forward pass
+        # This ensures scales are always computed with the latest weights
+        if self._should_reset_kv_scales():
+            logger.info("Resetting KV scale flags after weight update")
+            model_runner = self._get_model_runner()
+            self._reset_kv_scale_flags(model_runner)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""

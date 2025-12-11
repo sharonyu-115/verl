@@ -18,7 +18,7 @@ defaults:
   # Critic model config.
   - critic@critic: megatron_critic
   # Reward model config.
-  - reward_model@reward_model: megatron_reward_model
+  - reward_model@reward_model: megatron_reward_loop
   # Rollout correction config.
   - algorithm@algorithm.rollout_correction: rollout_correction
   - _self_
@@ -100,7 +100,10 @@ actor_rollout_ref:
       freeze_language_model: True
 
   rollout:
-    quantization: null
+    quantization:
+      weight_dtype: null
+      kv_cache_dtype: null
+      calculate_kv_scales: false
 
     layer_name_map:
       qkv_layer_name: qkv

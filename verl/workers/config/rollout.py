@@ -28,6 +28,7 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "PrometheusConfig",
+    "QuantizationConfig",
     "RolloutConfig",
 ]
 
@@ -114,18 +115,38 @@ class PrometheusConfig(BaseConfig):
 
 
 @dataclass
+class QuantizationConfig(BaseConfig):
+    """
+    Configuration for quantization options in rollout.
+    Groups all quantization-related settings together.
+    """
+
+    weight_dtype: Optional[str] = None
+    """Weight quantization data type. null (default, no quantization) or 'fp8' for FP8 weight quantization."""
+    
+    kv_cache_dtype: Optional[str] = None
+    """KV cache data type for attention layers. null (default, BF16/FP16) or 'fp8' for FP8 KV cache.
+    Can be used independently or with weight_dtype='fp8' for maximum memory savings."""
+    
+    calculate_kv_scales: bool = False
+    """Whether to dynamically calculate KV scales for FP8 KV cache.
+    Required to be True when kv_cache_dtype is 'fp8'.
+    When True, vLLM recalculates scales based on actual K/V distributions after each weight update."""
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
     name: Optional[str] = MISSING
     mode: str = "async"
-    skip_tokenizer_init: bool = True
 
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0
     do_sample: bool = True
     n: int = 1
+    repetition_penalty: float = 1.0
 
     # Early termination threshold for multi-turn rollout in sglang.
     # Abort remaining requests when (1 - over_sample_rate) * total_requests are completed.
@@ -140,6 +161,11 @@ class RolloutConfig(BaseConfig):
     enforce_eager: bool = True
     cudagraph_capture_sizes: Optional[list] = None
     free_cache_engine: bool = True
+    
+    # Quantization configuration (groups weight and KV cache quantization settings)
+    quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
+    """Quantization configuration for weights and KV cache."""
+    
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2
@@ -203,7 +229,6 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
-    quantization: Optional[str] = None
     enable_rollout_routing_replay: bool = False
 
     def __post_init__(self):

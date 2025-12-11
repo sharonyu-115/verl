@@ -16,6 +16,8 @@ import asyncio
 import json
 import logging
 import os
+import threading
+from concurrent.futures import Future
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -35,7 +37,15 @@ from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+# Catch import error and import from different path
+try:
+    from vllm.utils import get_tcp_uri
+except ImportError:
+    from vllm.utils.network_utils import get_tcp_uri
+try:
+    from vllm.utils import FlexibleArgumentParser
+except ImportError:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -96,8 +106,23 @@ class ExternalZeroMQDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
+        non_block: bool = False,
         **kwargs_extra: Any,
     ) -> list[Any]:
+        """Execute RPC call on all workers via ZeroMQ.
+        
+        Args:
+            method: Method name or callable to execute
+            timeout: Timeout for the operation (currently unused)
+            args: Positional arguments
+            kwargs: Keyword arguments
+            non_block: If True, return Future objects for async execution.
+                      If False (default), block until completion for backward compatibility.
+            **kwargs_extra: Additional keyword arguments (for compatibility)
+        
+        Returns:
+            List of results from all workers, or list of Futures if non_block=True
+        """
         if isinstance(method, str):
             sent_method = method
         else:
@@ -108,14 +133,39 @@ class ExternalZeroMQDistributedExecutor(Executor):
         for socket in self.sockets:
             socket.send(message, zmq.DONTWAIT)
 
-        outputs = []
-        for socket in self.sockets:
-            outputs.append(pickle.loads(socket.recv()))
+        if non_block:
+            # For async execution, return Future objects
+            futures = []
+            for socket in self.sockets:
+                future = Future()
+                
+                def _recv_async(sock, fut):
+                    try:
+                        output = pickle.loads(sock.recv())
+                        if isinstance(output, Exception):
+                            fut.set_exception(output)
+                        else:
+                            fut.set_result(output)
+                    except Exception as e:
+                        fut.set_exception(e)
+                
+                # Start a thread to receive the result asynchronously
+                thread = threading.Thread(target=_recv_async, args=(socket, future))
+                thread.daemon = True
+                thread.start()
+                futures.append(future)
 
-        for output in outputs:
-            if isinstance(output, Exception):
-                raise output
-        return outputs
+            return futures
+        else:
+            # Blocking execution - maintain backward compatibility with vllm 0.11.0
+            outputs = []
+            for socket in self.sockets:
+                outputs.append(pickle.loads(socket.recv()))
+
+            for output in outputs:
+                if isinstance(output, Exception):
+                    raise output
+            return outputs
 
     def check_health(self):
         return
@@ -216,7 +266,7 @@ class vLLMHttpServerBase:
             max_new_tokens=self.config.response_length,
         )
         logger.info(f"override_generation_config: {override_generation_config}")
-        quantization = self.config.quantization
+        quantization = self.config.quantization.weight_dtype
         if quantization is not None:
             if quantization == "fp8":
                 FP8_BLOCK_QUANT_KWARGS = {
@@ -253,7 +303,21 @@ class vLLMHttpServerBase:
             "hf_overrides": {"quantization_config": fp8_block_quant_kwargs} if quantization == "fp8" else None,
             **engine_kwargs,
         }
-
+        
+        # Get and validate KV cache configuration
+        from verl.utils.vllm.vllm_fp8_utils import validate_kv_cache_fp8_config
+        kv_cache_dtype, calculate_kv_scales = validate_kv_cache_fp8_config(self.config)
+        
+        # Add KV cache dtype configuration (independent of weight quantization)
+        if kv_cache_dtype is not None:
+            args["kv_cache_dtype"] = kv_cache_dtype
+            logger.info(f"Setting kv_cache_dtype: {kv_cache_dtype}")
+        
+        # Add calculate_kv_scales flag
+        if calculate_kv_scales:
+            args["calculate_kv_scales"] = True
+            logger.info("Enabling dynamic KV scale calculation")
+            
         if self.config.prometheus.enable:
             if self.config.prometheus.served_model_name:
                 # Extract model name from path if it's a full path
@@ -358,7 +422,12 @@ class vLLMHttpServerBase:
         await engine_client.reset_mm_cache()
 
         app = build_app(args)
-        await init_app_state(engine_client, vllm_config, app.state, args)
+        # if vllm version is 0.11.1 or higher, call init_app_state with 3 parameters
+        import vllm
+        if vllm.__version__ >= "0.11.1":
+            await init_app_state(engine_client, app.state, args)
+        else:
+            await init_app_state(engine_client, vllm_config, app.state, args)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
@@ -438,7 +507,18 @@ class vLLMHttpServerBase:
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
 
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts)
+        # Determine stop reason from finish_reason
+        finish_reason = final_res.outputs[0].finish_reason
+        if finish_reason == "abort":
+            stop_reason = "aborted"
+        elif finish_reason in ("stop", "length"):
+            stop_reason = "completed"
+        else:
+            stop_reason = finish_reason  # for more stop reason in the future
+
+        return TokenOutput(
+            token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts, stop_reason=stop_reason
+        )
 
     async def wake_up(self):
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -469,6 +549,78 @@ class vLLMHttpServerBase:
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
+
+    async def abort_all_requests(self) -> dict[str, Any]:
+        """Abort all ongoing generation requests.
+
+        Returns:
+            dict[str, Any]: Dictionary containing:
+                - aborted_count: Number of requests aborted
+                - request_ids: List of aborted request IDs
+        """
+        try:
+            # Take an atomic snapshot to avoid race conditions with the vLLM engine thread
+            request_states_snapshot = list(self.engine.output_processor.request_states.items())
+            request_ids = [req_id for req_id, _ in request_states_snapshot]
+
+            if not request_ids:
+                return {"aborted_count": 0, "request_ids": []}
+
+            # For each request, create an abort output and put it to its queue
+            # This allows the generator to receive the aborted result
+            from vllm.v1.engine import FinishReason
+
+            for _, req_state in request_states_snapshot:
+                request_output = req_state.make_request_output(
+                    [], pooling_output=None, finish_reason=FinishReason.ABORT, stop_reason=None
+                )
+                req_state.queue.put(request_output)
+
+            # Abort requests in the output processor and engine core
+            self.engine.output_processor.abort_requests(request_ids)
+            await self.engine.engine_core.abort_requests_async(request_ids)
+
+            logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
+            return {"aborted_count": len(request_ids), "request_ids": request_ids}
+
+        except Exception as e:
+            logger.error(f"Error aborting requests: {e}")
+            return {"aborted_count": 0, "request_ids": [], "error": str(e)}
+
+    async def abort_request(self, request_id: str) -> dict[str, Any]:
+        """Abort a specific generation request.
+
+        Args:
+            request_id: The ID of the request to abort.
+
+        Returns:
+            dict[str, Any]: Dictionary containing abort result.
+        """
+        try:
+            request_states = self.engine.output_processor.request_states
+            req_state = request_states.get(request_id)
+
+            if req_state is None:
+                return {"aborted": False, "error": f"Request {request_id} not found"}
+
+            # Create abort output and put it to the queue
+            from vllm.v1.engine import FinishReason
+
+            request_output = req_state.make_request_output(
+                [], pooling_output=None, finish_reason=FinishReason.ABORT, stop_reason=None
+            )
+            req_state.queue.put(request_output)
+
+            # Abort in output processor and engine core
+            self.engine.output_processor.abort_requests([request_id])
+            await self.engine.engine_core.abort_requests_async([request_id])
+
+            logger.info(f"Aborted request: {request_id}")
+            return {"aborted": True, "request_id": request_id}
+
+        except Exception as e:
+            logger.error(f"Error aborting request {request_id}: {e}")
+            return {"aborted": False, "request_id": request_id, "error": str(e)}
 
 
 @ray.remote(num_cpus=1)
@@ -588,6 +740,43 @@ class vLLMReplica(RolloutReplica):
         # Drain DP engines for safe sleep.
         await self.servers[0].wait_for_requests_to_drain.remote()
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+
+    async def abort_all_requests(self) -> dict[str, Any]:
+        """Abort all ongoing generation requests across all servers.
+
+        Returns:
+            dict[str, Any]: Combined abort results from all servers.
+        """
+        results = await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])
+
+        total_aborted = sum(r.get("aborted_count", 0) for r in results)
+        all_request_ids = []
+        for r in results:
+            all_request_ids.extend(r.get("request_ids", []))
+
+        return {
+            "aborted_count": total_aborted,
+            "request_ids": all_request_ids,
+            "server_results": results,
+        }
+
+    async def abort_request(self, request_id: str) -> dict[str, Any]:
+        """Abort a specific request. Tries all servers since we don't know which one has it.
+
+        Args:
+            request_id: The ID of the request to abort.
+
+        Returns:
+            dict[str, Any]: Abort result.
+        """
+        # TODO(petersh6): we should only abort on the server that has the request.
+        results = await asyncio.gather(*[server.abort_request.remote(request_id) for server in self.servers])
+
+        for r in results:
+            if r.get("aborted", False):
+                return r
+
+        return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
 
 
 def _qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):

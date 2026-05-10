@@ -509,6 +509,27 @@ def process_weights_after_loading_for_vllm14(self, layer) -> None:
 
     maybe_post_process_fp8_weight_block(layer)
 
+    # vLLM 0.17's deepgemm path inside maybe_post_process_fp8_weight_block calls
+    # `replace_parameter`, which constructs a brand-new `torch.nn.Parameter` and
+    # only copies `weight_loader`, dropping the vLLM Parameter type and its
+    # `_output_dim`/`_input_dim`/`tp_rank`/`tp_size` state. The FSDP->vLLM
+    # reload path (load_quanted_weights -> model.load_weights -> weight_loader_v2
+    # -> param.load_qkv_weight) needs all of that, so re-construct as a proper
+    # vLLM Parameter using the post-deepgemm data.
+    for attr_name, cls in (
+        ("weight", ModelWeightParameter),
+        ("weight_scale_inv", BlockQuantScaleParameter),
+    ):
+        p = getattr(layer, attr_name, None)
+        if p is None or hasattr(p, "_output_dim"):
+            continue
+        weight_loader = getattr(p, "weight_loader", None) or getattr(p, "_weight_loader", None)
+        setattr(
+            layer,
+            attr_name,
+            cls(data=p.data, output_dim=0, input_dim=1, weight_loader=weight_loader),
+        )
+
 
 def process_weights_after_loading_moe_for_vllm10(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer, it is used for vllm v0.10"""
